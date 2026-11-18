@@ -50,10 +50,21 @@ struct nvk_core;
 int  xrt_preinit(void);
 int  xrt_on(void);
 int  xrt_start(const struct nvk_core *C);
+/* A frame's 3D inputs (fb_present_vulkan.c): the slot (the frame with its
+ * HUD, before the post passes), the scene before the HUD and its depth (R32
+ * float), all w x h, with the picture at rect (x, y, w, h). */
+struct xrt_scene {
+    VkImage frame;
+    VkImageView frame_view, scene_view, depth_view;
+    uint32_t w, h;
+    int rect[4];
+};
+
 /* sampled: img has SAMPLED usage (drawn, scaled to at most 1920 wide, by a
  * render pass); else copied as it is. sw, sh: img's size. */
 void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt,
-                     int x, int y, int w, int h, int sampled, uint32_t sw, uint32_t sh);
+                     int x, int y, int w, int h, int sampled, uint32_t sw, uint32_t sh,
+                     const struct xrt_scene *scene);
 void xrt_quad_submitted(int ok);
 void xrt_shutdown(void);
 

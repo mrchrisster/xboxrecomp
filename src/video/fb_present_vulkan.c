@@ -140,6 +140,10 @@ static VkSemaphore      s_done[SC_MAX];
 static int              s_fi;
 
 static struct nvk_image s_slot[3];       /* GENERAL once written */
+/* A headset's 3D (xr_theater.c): each slot's scene before the HUD and its
+ * depth, written by the backend at the flip (nv2a_pb_vulkan.c xs_flip). */
+struct fbv_scene_img { struct nvk_image col, dep; int valid; };
+static struct fbv_scene_img s_scene[3];
 static void post_destroy(void);          /* the post passes, below */
 
 /* BO-110, HDR output: the swapchain in HDR10 (ST 2084 PQ, BT.2020) where the
@@ -160,6 +164,7 @@ static struct nvk_image s_hcomp;         /* the overlay before its encode (HDR) 
 /* The game picture's rectangle in the swapchain image, for the headset's
  * screen (the last frame's, when one has no new picture). */
 static int s_xr_rect[4];
+static int s_xr_src[4];         /* the same picture's rectangle in the slot */
 static int s_sc_sampled;     /* the swapchain images can be sampled (the headset's draw) */
 
 static int  hdr_wanted(void) { return nv2a_host_hdr_active(); }
@@ -2203,6 +2208,34 @@ void fbv_destroy(void)
      * the process is about to exit. */
 }
 
+struct fbv_scene_img *fbv_slot_scene(const void *slot, uint32_t w, uint32_t h)
+{
+    int k;
+    struct fbv_scene_img *s;
+    for (k = 0; k < 3; k++)
+        if (slot == (const void *)&s_slot[k])
+            break;
+    if (k == 3 || !C)
+        return NULL;
+    s = &s_scene[k];
+    if (!s->col.img || s->col.w != w || s->col.h != h) {
+        if (s->col.img) {
+            vkQueueWaitIdle(C->queue);   /* rare: the frame size changed */
+            nvk_image_free(&s->col);
+            nvk_image_free(&s->dep);
+        }
+        s->valid = 0;
+        if (!nvk_image_new(&s->col, VK_FORMAT_B8G8R8A8_UNORM, w, h, 1,
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                           VK_IMAGE_ASPECT_COLOR_BIT)
+                || !nvk_image_new(&s->dep, VK_FORMAT_R32_SFLOAT, w, h, 1,
+                                  VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                                  VK_IMAGE_ASPECT_COLOR_BIT))
+            return NULL;
+    }
+    return s;
+}
+
 void *fbv_slot(int k, uint32_t w, uint32_t h)
 {
     struct nvk_image *s = &s_slot[k];
@@ -3445,6 +3478,10 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         whole = nv2a_present_layout(sw, sh, (uint32_t)s_sc_ext.width,
                                     (uint32_t)s_sc_ext.height, filter, &sr, &r2);
         if (r2.w > 0 && r2.h > 0) {
+            s_xr_src[0] = (int)sr.x;
+            s_xr_src[1] = (int)sr.y;
+            s_xr_src[2] = (int)sr.w;
+            s_xr_src[3] = (int)sr.h;
             s_xr_rect[0] = (int)r2.x;
             s_xr_rect[1] = (int)r2.y;
             s_xr_rect[2] = (int)r2.w;
@@ -3574,9 +3611,25 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
     if (xrt_on() && !hdr && s_xr_rect[2] > 0)
         /* The headset's screen: the picture (and the overlay over it) into
          * the OpenXR quad, still in TRANSFER_DST after. */
+    {
+        /* The 3D's inputs: the slot (the frame with its HUD, before the
+         * post passes), its scene before the HUD and the scene's depth. */
+        struct xrt_scene xs;
+        memset(&xs, 0, sizeof xs);
+        if (s_scene[k].valid && s_slot[k].img && s_scene[k].col.w == s_slot[k].w
+                && s_scene[k].col.h == s_slot[k].h && s_xr_src[2] > 0) {
+            xs.frame = s_slot[k].img;
+            xs.frame_view = s_slot[k].view;
+            xs.scene_view = s_scene[k].col.view;
+            xs.depth_view = s_scene[k].dep.view;
+            xs.w = s_slot[k].w;
+            xs.h = s_slot[k].h;
+            memcpy(xs.rect, s_xr_src, sizeof xs.rect);
+        }
         xrt_quad_record(cb, s_sc_img[idx], s_sc_fmt, s_xr_rect[0], s_xr_rect[1],
                         s_xr_rect[2], s_xr_rect[3], s_sc_sampled,
-                        s_sc_ext.width, s_sc_ext.height);
+                        s_sc_ext.width, s_sc_ext.height, xs.scene_view ? &xs : NULL);
+    }
     if (shot) {
         VkBufferImageCopy bc;
         nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,

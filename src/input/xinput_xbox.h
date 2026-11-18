@@ -114,6 +114,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
  * remove it. */
 void xbox_InputSetXrSource(int (*state)(XBOX_INPUT_STATE *out),
                            void (*rumble)(unsigned left, unsigned right));
+/* A headset's controllers are in use (an XR source is set). */
+int xbox_InputXrSourceActive(void);
 
 /**
  * The rumble's clock: moves a port's falling motors on and re-issues a held

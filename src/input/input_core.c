@@ -569,6 +569,8 @@ void xbox_InputSetXrSource(int (*state)(XBOX_INPUT_STATE *out),
     g_xr_rumble = rumble;
 }
 
+int xbox_InputXrSourceActive(void) { return g_xr_state != NULL; }
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XBOX_INPUT_STATE kb, tp;

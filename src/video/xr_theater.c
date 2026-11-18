@@ -93,7 +93,12 @@ static XrQuaternionf facing(V3 dir)
 #define PROJ_DIM 64
 #define MAXIMG 8
 
-enum { M_RESUME, M_BACKGROUND, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
+enum { M_RESUME, M_BACKGROUND, M_3D, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
+
+/* 3D depth levels: the shift at infinity, in picture widths (Futurama's
+ * 0.022 clip-space units x its 1 / 1.6 / 2.3 scale, halved for uv). */
+static const float k_depth[4] = {0.0f, 0.011f, 0.0176f, 0.0253f};
+static const char *const k_depth_name[4] = {"OFF", "NORMAL", "DEEP", "EXTRA"};
 
 static struct {
     int on;
@@ -118,6 +123,17 @@ static struct {
     /* the draw into it (GT3-revisited's lesson: a render pass, not a
      * transfer copy, into a Quest swapchain image) */
     int draw_ok;                 /* -1 failed: the copy instead */
+    int depth_level, last_depth_on, prev_3d_chord;
+    int quad_stereo;             /* the quad is side by side, an eye a half */
+    int sdraw_ok;                /* the 3D pipeline: 0 not yet, 1 ok, -1 failed */
+    VkPipelineLayout spl;
+    VkPipeline spipe;
+    VkDescriptorSetLayout sdsl;
+    VkDescriptorPool sdpool;
+    VkSampler snear;
+    struct { VkImage img; VkImageView fv, sv, dv; VkDescriptorSet set; } ssrc[16];
+    int nssrc;
+    uint64_t frames3d, frames2d;
     VkPipelineLayout pl;
     VkPipeline pipe;
     VkDescriptorSetLayout dsl;
@@ -396,19 +412,24 @@ static void load_view(void)
     X.height = DEF_HEIGHT;
     X.elev = DEF_ELEV;
     X.dark = DEF_DARK;
+    X.depth_level = 1;
     if (!dir)
         return;
     snprintf(X.prefs, sizeof X.prefs, "%s/xr_view.txt", dir);
     f = fopen(X.prefs, "r");
     if (!f)
         return;
-    if (fscanf(f, "%7s %f %f %f %d", tag, &d, &h, &e, &dk) == 5 && !strcmp(tag, "t1")) {
+    X.depth_level = 1;
+    if (fscanf(f, "%7s %f %f %f %d", tag, &d, &h, &e, &dk) == 5 && (!strcmp(tag, "t1") || !strcmp(tag, "t2"))) {
+        int lv = 1;
+        if (!strcmp(tag, "t2") && fscanf(f, "%d", &lv) == 1)
+            X.depth_level = lv < 0 ? 0 : lv > 3 ? 3 : lv;
         X.dist = clampf(d, MIN_DIST, MAX_DIST);
         X.height = clampf(h, MIN_H, MAX_H);
         X.elev = clampf(e, -1.2f, 1.2f);
         X.dark = dk != 0;
-        fprintf(stderr, LOGX "view restored: %.2f m away, %.2f m tall, elevation %.2f, %s\n", X.dist,
-                X.height, X.elev, X.dark ? "dark room" : "mixed reality");
+        fprintf(stderr, LOGX "view restored: %.2f m away, %.2f m tall, elevation %.2f, %s, 3D %s\n", X.dist,
+                X.height, X.elev, X.dark ? "dark room" : "mixed reality", k_depth_name[X.depth_level]);
     }
     fclose(f);
 }
@@ -419,7 +440,7 @@ static void save_view(void)
     X.view_dirty = 0;
     if (!X.prefs[0] || !(f = fopen(X.prefs, "w")))
         return;
-    fprintf(f, "t1 %.3f %.3f %.3f %d\n", X.dist, X.height, X.elev, X.dark);
+    fprintf(f, "t2 %.3f %.3f %.3f %d %d\n", X.dist, X.height, X.elev, X.dark, X.depth_level);
     fclose(f);
 }
 
@@ -585,9 +606,10 @@ static int mwidth(const char *t, int s) { return (int)strlen(t) * 6 * s - s; }
 
 static void draw_menu(uint8_t *img)
 {
-    static const char *labels[M_COUNT] = {"RESUME", "BACKGROUND", "RECENTER SCREEN", "RESET SCREEN", "EXIT GAME"};
-    const char *values[M_COUNT] = {"", X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY", "", "",
-                                   X.exit_armed ? "PRESS A AGAIN" : ""};
+    static const char *labels[M_COUNT] = {"RESUME", "BACKGROUND", "3D DEPTH", "RECENTER SCREEN", "RESET SCREEN",
+                                          "EXIT GAME"};
+    const char *values[M_COUNT] = {"", X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY",
+                                   k_depth_name[X.depth_level], "", "", X.exit_armed ? "PRESS A AGAIN" : ""};
     const int band = 170, top = band + 6 + 40;
     int i;
     mfill(img, 0, 0, MENU_W, MENU_H, 0xF26B1DFFu);              /* orange border */
@@ -596,7 +618,7 @@ static void draw_menu(uint8_t *img)
     mtext(img, (MENU_W - mwidth("BURNOUT 3", 12)) / 2, 6 + 22, 12, 0xF26B1DFFu, "BURNOUT 3");
     mtext(img, (MENU_W - mwidth("TAKEDAWN VR", 4)) / 2, 6 + 22 + 96, 4, 0xFFD24AFFu, "TAKEDAWN VR");
     for (i = 0; i < M_COUNT; i++) {
-        int y = top + i * 70, sel = i == X.menu_sel;
+        int y = top + i * 64, sel = i == X.menu_sel;
         uint32_t fg = sel ? 0x101014FFu : 0xFFFFFFFFu;
         if (sel)
             mfill(img, 20, y - 10, MENU_W - 40, 58, 0xF26B1DFFu);
@@ -635,6 +657,13 @@ static void menu_activate(int dir)
             break;
         X.dark = !X.dark;
         apply_background();
+        save_view();
+        break;
+    case M_3D:
+        X.depth_level = (X.depth_level + (dir < 0 ? 3 : 1)) % 4;
+        if (X.depth_level)
+            X.last_depth_on = X.depth_level;
+        nvk_xr_scene_wanted = X.depth_level > 0;
         save_view();
         break;
     case M_RECENTER:
@@ -768,6 +797,20 @@ static void sync_actions(void)
     X.prev_menu_chord = chord;
 
     window = lb && rb;
+    {   /* LB + RB + L3: 3D on / off (the last level) */
+        int c3 = window && l3 && !r3;
+        if (c3 && !X.prev_3d_chord) {
+            if (X.depth_level)
+                X.last_depth_on = X.depth_level, X.depth_level = 0;
+            else
+                X.depth_level = X.last_depth_on ? X.last_depth_on : 1;
+            nvk_xr_scene_wanted = X.depth_level > 0;
+            X.view_dirty = 1;
+            X.menu_dirty = 1;
+            fprintf(stderr, LOGX "3D %s\n", k_depth_name[X.depth_level]);
+        }
+        X.prev_3d_chord = c3;
+    }
     bg = window && r3 && !l3;
     if (bg && !X.prev_bg) {
         X.dark = !X.dark;
@@ -1377,23 +1420,221 @@ static VkDescriptorSet src_set(VkImage img, VkFormat fmt)
     return X.src[i].set;
 }
 
+/* ---- the 3D: each eye from the scene and its depth ----
+ * The Futurama shift, x += eye * S * (1 - focus / w), is linear in the depth
+ * buffer's value (window z is linear in 1/w), so per pixel the shift is
+ * S * (d - f) / (1 - f): 0 at the focus depth f, S at the far plane (the sky),
+ * negative (out of the screen) nearer than f, held to -pop. f is taken each
+ * frame from three points where the car sits in the chase view. An eye's
+ * pixel is looked up where its shift brings it from (a fixed point, four
+ * steps). The HUD (the frame's pixels the scene lacks: frame != scene) is
+ * not shifted: it stays on the screen plane, flat, as in Futurama. */
+static const char k_sfs[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D fin;\n"   /* the presented picture (post passes) */
+    "layout(set = 0, binding = 1) uniform sampler2D frm;\n"   /* the frame with its HUD */
+    "layout(set = 0, binding = 2) uniform sampler2D scn;\n"   /* the scene before the HUD */
+    "layout(set = 0, binding = 3) uniform sampler2D dep;\n"   /* its depth */
+    "layout(push_constant) uniform P { vec4 rf; vec4 rs; vec4 st; } p;\n"
+    "layout(location = 0) in vec2 uv;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "vec3 lin(vec3 c) {\n"
+    "    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"
+    "}\n"
+    "vec2 S(vec2 u) { return p.rs.xy + clamp(u, 0.0, 1.0) * p.rs.zw; }\n"
+    "float D(vec2 u) { return texture(dep, S(u)).r; }\n"
+    "bool hud(vec2 u) {\n"
+    "    vec3 d = abs(texture(frm, S(u)).rgb - texture(scn, S(u)).rgb);\n"
+    "    return max(d.r, max(d.g, d.b)) > p.st.z;\n"
+    "}\n"
+    "void main() {\n"
+    "    float f = (D(vec2(0.5, 0.62)) + D(vec2(0.42, 0.68)) + D(vec2(0.58, 0.68))) / 3.0;\n"
+    "    f = min(f, 0.99999);\n"
+    "    float s = uv.x;\n"
+    "    for (int i = 0; i < 4; i++) {\n"
+    "        float k = clamp((D(vec2(s, uv.y)) - f) / max(1.0 - f, 1e-6), -p.st.y, 1.0);\n"
+    "        s = uv.x - p.st.x * k;\n"
+    "    }\n"
+    "    vec2 su = vec2(clamp(s, 0.0, 1.0), uv.y);\n"
+    "    vec3 c;\n"
+    "    if (hud(uv)) c = texture(fin, p.rf.xy + uv * p.rf.zw).rgb;\n"
+    "    else if (hud(su)) c = texture(scn, S(su)).rgb;\n"
+    "    else c = texture(fin, p.rf.xy + su * p.rf.zw).rgb;\n"
+    "    o = vec4(lin(c), 1.0);\n"
+    "}\n";
+
+static int sdraw_init(VkFormat fmt)
+{
+    VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkDescriptorSetLayoutBinding b[4];
+    VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 * 4};
+    VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkShaderModule vs, fs;
+    VkPipelineShaderStageCreateInfo st[2];
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba = {0};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo gp = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkResult r;
+    int i;
+
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &fmt;
+    memset(b, 0, sizeof b);
+    for (i = 0; i < 4; i++) {
+        b[i].binding = (uint32_t)i;
+        b[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b[i].descriptorCount = 1;
+        b[i].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    }
+    dl.bindingCount = 4;
+    dl.pBindings = b;
+    if (vkCreateDescriptorSetLayout(X.C->dev, &dl, NULL, &X.sdsl) != VK_SUCCESS)
+        return 0;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &X.sdsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(X.C->dev, &plci, NULL, &X.spl) != VK_SUCCESS)
+        return 0;
+    dp.maxSets = 16;
+    dp.poolSizeCount = 1;
+    dp.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(X.C->dev, &dp, NULL, &X.sdpool) != VK_SUCCESS)
+        return 0;
+    sci.magFilter = VK_FILTER_NEAREST;   /* the frame, scene and depth: texel for texel */
+    sci.minFilter = VK_FILTER_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateSampler(X.C->dev, &sci, NULL, &X.snear) != VK_SUCCESS)
+        return 0;
+    vs = shader(NVK_STAGE_VERTEX, k_vs);
+    fs = shader(NVK_STAGE_FRAGMENT, k_sfs);
+    if (!vs || !fs)
+        return 0;
+    memset(st, 0, sizeof st);
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    st[0].module = vs;
+    st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    st[1].module = fs;
+    st[1].pName = "main";
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    cba.colorWriteMask = 0xF;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = dyn;
+    gp.pNext = &pr;
+    gp.stageCount = 2;
+    gp.pStages = st;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &ds;
+    gp.layout = X.spl;
+    r = vkCreateGraphicsPipelines(X.C->dev, VK_NULL_HANDLE, 1, &gp, NULL, &X.spipe);
+    vkDestroyShaderModule(X.C->dev, vs, NULL);
+    vkDestroyShaderModule(X.C->dev, fs, NULL);
+    return r == VK_SUCCESS;
+}
+
+/* A set per (presented image, slot): their views do not change while the
+ * images live; a full table starts over. */
+static VkDescriptorSet ssrc_set(VkImage src, VkFormat fmt, const struct xrt_scene *s)
+{
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    VkDescriptorImageInfo ii[4];
+    VkWriteDescriptorSet w[4];
+    VkImageView fv;
+    int i;
+    for (i = 0; i < X.nssrc; i++)
+        if (X.ssrc[i].img == src && X.ssrc[i].sv == s->scene_view && X.ssrc[i].dv == s->depth_view)
+            return X.ssrc[i].set;
+    if (X.nssrc == 16) {
+        vkResetDescriptorPool(X.C->dev, X.sdpool, 0);
+        X.nssrc = 0;
+    }
+    /* the presented image's view: the one draw path's (src_set made it) */
+    if (!src_set(src, fmt))
+        return VK_NULL_HANDLE;
+    fv = VK_NULL_HANDLE;
+    for (i = 0; i < X.nsrc; i++)
+        if (X.src[i].img == src)
+            fv = X.src[i].view;
+    i = X.nssrc;
+    ai.descriptorPool = X.sdpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &X.sdsl;
+    if (!fv || vkAllocateDescriptorSets(X.C->dev, &ai, &X.ssrc[i].set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    X.ssrc[i].img = src;
+    X.ssrc[i].fv = s->frame_view;
+    X.ssrc[i].sv = s->scene_view;
+    X.ssrc[i].dv = s->depth_view;
+    ii[0].sampler = X.smp;
+    ii[0].imageView = fv;
+    ii[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ii[1].sampler = X.snear;
+    ii[1].imageView = s->frame_view;
+    ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ii[2] = ii[1];
+    ii[2].imageView = s->scene_view;
+    ii[3] = ii[1];
+    ii[3].imageView = s->depth_view;
+    for (int k = 0; k < 4; k++) {
+        memset(&w[k], 0, sizeof w[k]);
+        w[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w[k].dstSet = X.ssrc[i].set;
+        w[k].dstBinding = (uint32_t)k;
+        w[k].descriptorCount = 1;
+        w[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        w[k].pImageInfo = &ii[k];
+    }
+    vkUpdateDescriptorSets(X.C->dev, 4, w, 0, NULL);
+    X.nssrc++;
+    return X.ssrc[i].set;
+}
+
 /* ---- the presenter's side ---- */
 /* The screen's size: the picture's, at most XR_MAX_W wide (the immersive
  * window is the panel's 4128x2208; the game draws a fraction of that). */
 #define XR_MAX_W 1920
 
 void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y, int w, int h,
-                     int sampled, uint32_t sw, uint32_t sh)
+                     int sampled, uint32_t sw, uint32_t sh, const struct xrt_scene *scene)
 {
     VkImageCopy c;
     int64_t want;
-    uint32_t qw, qh, i;
-    int draw;
+    uint32_t qw, qh, i, scw;
+    int draw, stereo;
     if (!X.on || !X.session || w <= 0 || h <= 0 || X.quad_acquired)
         return;
     if (X.draw_ok == 0 && sampled)
         X.draw_ok = draw_init((VkFormat)X.fmt_srgb) ? 1 : -1;
     draw = sampled && X.draw_ok > 0;
+    if (draw && X.depth_level > 0 && X.sdraw_ok == 0)
+        X.sdraw_ok = sdraw_init((VkFormat)X.fmt_srgb) ? 1 : -1;
+    stereo = draw && X.depth_level > 0 && X.sdraw_ok > 0;
     if (draw) {
         want = X.fmt_srgb;
         qw = (uint32_t)w > XR_MAX_W ? XR_MAX_W : (uint32_t)w;
@@ -1406,7 +1647,9 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
     if (!want)
         return;      /* no matching format: a raw copy would swap the colours */
     pthread_mutex_lock(&X.quad_mu);
-    if (!X.quad || X.quad_w != qw || X.quad_h != qh || X.quad_fmt != (VkFormat)want) {
+    scw = stereo ? qw * 2 : qw;
+    if (!X.quad || X.quad_w != qw || X.quad_h != qh || X.quad_fmt != (VkFormat)want
+            || X.quad_stereo != stereo) {
         if (X.quad) {
             vkQueueWaitIdle(X.C->queue);
             for (i = 0; i < X.quad_n; i++) {
@@ -1416,19 +1659,20 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
             xrDestroySwapchain(X.quad);
         }
         X.quad_has_frame = 0;
-        X.quad = make_sc(want, qw, qh,
+        X.quad = make_sc(want, scw, qh,
                          XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
                          | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT);
         X.quad_n = X.quad ? enum_images(X.quad, X.quad_img) : 0;
         X.quad_w = qw;
         X.quad_h = qh;
         X.quad_fmt = (VkFormat)want;
+        X.quad_stereo = stereo;
         if (draw)
             for (i = 0; i < X.quad_n; i++)
                 X.quad_view[i] = view_of(X.quad_img[i], (VkFormat)want);
         update_size();
-        fprintf(stderr, LOGX "screen swapchain %ux%u from a %dx%d picture, %s (%s)\n", qw, qh, w, h,
-                draw ? "drawn" : "copied", X.quad ? "made" : "FAILED");
+        fprintf(stderr, LOGX "screen swapchain %ux%u%s from a %dx%d picture, %s (%s)\n", qw, qh,
+                stereo ? " x2 eyes" : "", w, h, draw ? "drawn" : "copied", X.quad ? "made" : "FAILED");
     }
     pthread_mutex_unlock(&X.quad_mu);
     if (!X.quad || !acquire(X.quad, &X.quad_idx) || X.quad_idx >= X.quad_n)
@@ -1439,8 +1683,9 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
         VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         VkRenderingInfo rb = {VK_STRUCTURE_TYPE_RENDERING_INFO};
         VkViewport v = {0, 0, (float)qw, (float)qh, 0, 1};
-        VkRect2D sc = {{0, 0}, {qw, qh}};
+        VkRect2D sc = {{0, 0}, {scw, qh}};
         float r[4];
+        VkDescriptorSet sset = stereo && scene ? ssrc_set(src, fmt, scene) : VK_NULL_HANDLE;
         barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1457,17 +1702,60 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
         rb.colorAttachmentCount = 1;
         rb.pColorAttachments = &ca;
         vkCmdBeginRendering(cb, &rb);
-        if (set) {
-            r[0] = (float)x / (float)sw;
-            r[1] = (float)y / (float)sh;
-            r[2] = (float)w / (float)sw;
-            r[3] = (float)h / (float)sh;
+        r[0] = (float)x / (float)sw;
+        r[1] = (float)y / (float)sh;
+        r[2] = (float)w / (float)sw;
+        r[3] = (float)h / (float)sh;
+        if (sset) {
+            /* the two eyes, each from the scene and its depth */
+            float pc[12];
+            int e;
+            VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            /* the backend's copies into the slot and its scene (earlier on
+             * the queue) before the reads here */
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdEndRendering(cb);
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                 0, 1, &mb, 0, NULL, 0, NULL);
+            vkCmdBeginRendering(cb, &rb);
+            memcpy(pc, r, sizeof r);
+            pc[4] = (float)scene->rect[0] / (float)scene->w;
+            pc[5] = (float)scene->rect[1] / (float)scene->h;
+            pc[6] = (float)scene->rect[2] / (float)scene->w;
+            pc[7] = (float)scene->rect[3] / (float)scene->h;
+            pc[9] = 0.35f;               /* out of the screen: at most 35% of the depth */
+            pc[10] = 3.0f / 255.0f;      /* a HUD pixel differs from the scene by more */
+            pc[11] = 0.0f;
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spipe);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spl, 0, 1, &sset, 0, NULL);
+            for (e = 0; e < 2; e++) {
+                static float dx = -1.0f;      /* RECOMP_XR_DEPTH_X: a test multiplier */
+                if (dx < 0.0f) {
+                    const char *ev = getenv("RECOMP_XR_DEPTH_X");
+                    dx = ev && atof(ev) > 0.0 ? (float)atof(ev) : 1.0f;
+                }
+                pc[8] = (e ? 0.5f : -0.5f) * k_depth[X.depth_level] * dx;   /* half each way */
+                v.x = (float)(e * qw);
+                vkCmdPushConstants(cb, X.spl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+                vkCmdSetViewport(cb, 0, 1, &v);
+                vkCmdSetScissor(cb, 0, 1, &sc);
+                vkCmdDraw(cb, 3, 1, 0, 0);
+            }
+            X.frames3d++;
+        } else if (set) {
+            /* flat: the picture in each half (no scene this frame: menus, films) */
+            int e;
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.pipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.pl, 0, 1, &set, 0, NULL);
             vkCmdPushConstants(cb, X.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, r);
-            vkCmdSetViewport(cb, 0, 1, &v);
-            vkCmdSetScissor(cb, 0, 1, &sc);
-            vkCmdDraw(cb, 3, 1, 0, 0);
+            for (e = 0; e < (stereo ? 2 : 1); e++) {
+                v.x = (float)(e * qw);
+                vkCmdSetViewport(cb, 0, 1, &v);
+                vkCmdSetScissor(cb, 0, 1, &sc);
+                vkCmdDraw(cb, 3, 1, 0, 0);
+            }
+            X.frames2d++;
         }
         vkCmdEndRendering(cb);
         barrier(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1550,14 +1838,14 @@ static void poll_events(void)
 
 static void end_frame(void)
 {
-    const XrCompositionLayerBaseHeader *layers[5];
+    const XrCompositionLayerBaseHeader *layers[6];
     uint32_t nl = 0, idx[2] = {0, 0}, e, n = 0;
     XrCompositionLayerPassthroughFB ptl = {XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB};
     XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
     XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                               {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     XrCompositionLayerProjection proj = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    XrCompositionLayerQuad ql = {XR_TYPE_COMPOSITION_LAYER_QUAD}, ml = {XR_TYPE_COMPOSITION_LAYER_QUAD};
+    XrCompositionLayerQuad ql = {XR_TYPE_COMPOSITION_LAYER_QUAD}, ml = {XR_TYPE_COMPOSITION_LAYER_QUAD}, qr;
     XrCompositionLayerSettingsFB qs = {XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
     XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
     int mr = X.pt_layer && !X.dark, show_menu = X.menu_open && X.menu_sc && X.fs.shouldRender;
@@ -1648,13 +1936,19 @@ static void end_frame(void)
             ql.next = &qs;
         }
         ql.space = X.local;
-        ql.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+        ql.eyeVisibility = X.quad_stereo ? XR_EYE_VISIBILITY_LEFT : XR_EYE_VISIBILITY_BOTH;
         ql.subImage.swapchain = X.quad;
         ql.subImage.imageRect.extent.width = (int32_t)X.quad_w;
         ql.subImage.imageRect.extent.height = (int32_t)X.quad_h;
         ql.pose = X.quad_pose;
         ql.size = X.quad_size;
         layers[nl++] = (const XrCompositionLayerBaseHeader *)&ql;
+        if (X.quad_stereo) {
+            qr = ql;
+            qr.eyeVisibility = XR_EYE_VISIBILITY_RIGHT;
+            qr.subImage.imageRect.offset.x = (int32_t)X.quad_w;
+            layers[nl++] = (const XrCompositionLayerBaseHeader *)&qr;
+        }
     }
     if (show_menu) {
         V3 nrm = qrot(X.quad_pose.orientation, v3(0, 0, 1));
@@ -1720,9 +2014,11 @@ static void *frame_main(void *arg)
         end_frame();
         if (++frames % 1200 == 0) {
             uint64_t t = now_ms();
-            fprintf(stderr, LOGX "frame thread: %.1f frames/s, screen %ux%u, %s\n",
+            fprintf(stderr, LOGX "frame thread: %.1f frames/s, screen %ux%u%s, %s, 3D %s (game frames: %llu 3D, %llu flat)\n",
                     1200.0 * 1000.0 / (double)(t - t0 ? t - t0 : 1), X.quad_w, X.quad_h,
-                    X.dark ? "dark room" : "mixed reality");
+                    X.quad_stereo ? " x2 eyes" : "", X.dark ? "dark room" : "mixed reality",
+                    k_depth_name[X.depth_level], (unsigned long long)X.frames3d,
+                    (unsigned long long)X.frames2d);
             t0 = t;
         }
     }
@@ -1792,6 +2088,8 @@ int xrt_start(const struct nvk_core *C)
             cs(X.session, XR_COLOR_SPACE_REC709_FB);
     }
     init_passthrough();
+    X.last_depth_on = X.depth_level ? X.depth_level : 1;
+    nvk_xr_scene_wanted = X.depth_level > 0;
     xbox_InputSetXrSource(xr_pad_state, xr_rumble);
     X.thread_run = 1;
     if (pthread_create(&X.thread, NULL, frame_main, NULL) != 0) {
@@ -1822,8 +2120,8 @@ int  xrt_preinit(void) { return 0; }
 int  xrt_on(void) { return 0; }
 int  xrt_start(const struct nvk_core *C) { (void)C; return 0; }
 void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y, int w, int h,
-                     int sampled, uint32_t sw, uint32_t sh)
-{ (void)cb; (void)src; (void)fmt; (void)x; (void)y; (void)w; (void)h; (void)sampled; (void)sw; (void)sh; }
+                     int sampled, uint32_t sw, uint32_t sh, const struct xrt_scene *scene)
+{ (void)scene; (void)cb; (void)src; (void)fmt; (void)x; (void)y; (void)w; (void)h; (void)sampled; (void)sw; (void)sh; }
 void xrt_quad_submitted(int ok) { (void)ok; }
 void xrt_shutdown(void) {}
 

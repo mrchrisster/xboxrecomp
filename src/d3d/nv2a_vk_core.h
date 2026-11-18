@@ -109,6 +109,9 @@ struct nvk_xr_hooks {
     VkResult (*create_device)(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
 };
 void nvk_core_set_xr_hooks(const struct nvk_xr_hooks *h);
+/* A headset wants each frame's scene (colour, depth) before the HUD
+ * (nv2a_pb_vulkan.c xs_mark, video/xr_theater.c's 3D). */
+extern volatile int nvk_xr_scene_wanted;
 
 void nvk_queue_lock(void);
 void nvk_queue_unlock(void);

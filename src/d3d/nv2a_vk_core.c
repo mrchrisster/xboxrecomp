@@ -66,6 +66,7 @@ static int fail(const char *fmt, const char *a, VkResult r)
 }
 
 static struct nvk_xr_hooks s_xr;
+volatile int nvk_xr_scene_wanted;
 
 void nvk_core_set_xr_hooks(const struct nvk_xr_hooks *h)
 {

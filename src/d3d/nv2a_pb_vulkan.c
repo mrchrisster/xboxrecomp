@@ -6854,6 +6854,139 @@ static void hdr_draw(const RenderTarget *rt, float hdr[4])
     }
 }
 
+/* ---- the scene before the HUD, for a headset's 3D (video/xr_theater.c) ----
+ * While nvk_xr_scene_wanted is set: when a draw outside the title's scene
+ * marks (nv2a_pb_stream_tag) follows the scene's own draws into the target
+ * the last flips showed, that target's colour and depth are copied aside
+ * (the 3D picture with no HUD yet, and its depth); the flip copies them next
+ * to the window slot (fbv_slot_scene). A frame with no scene (menus, films)
+ * has none: the headset shows it flat. Depth goes through a buffer into an
+ * R32 float image, as a sampled colour image. */
+struct fbv_scene_img { struct nvk_image col, dep; int valid; };
+extern struct fbv_scene_img *fbv_slot_scene(const void *slot, uint32_t w, uint32_t h);
+static struct nvk_image  s_xs_col, s_xs_dep;
+static struct nvk_buffer s_xs_buf;
+static int      s_xs_have;          /* this frame's scene is copied aside */
+static int      s_xs_last_scene;    /* the last draw into a shown target was the scene's */
+static uint32_t s_xs_w, s_xs_h;
+
+static int xs_images(uint32_t w, uint32_t h)
+{
+    if (s_xs_col.img && s_xs_col.w == w && s_xs_col.h == h)
+        return 1;
+    if (s_xs_col.img) {
+        vkQueueWaitIdle(C->queue);
+        nvk_image_free(&s_xs_col);
+        nvk_image_free(&s_xs_dep);
+        nvk_buffer_free(&s_xs_buf);
+    }
+    if (!nvk_image_new(&s_xs_col, RT_FORMAT, w, h, 1,
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                       VK_IMAGE_ASPECT_COLOR_BIT)
+            || !nvk_image_new(&s_xs_dep, VK_FORMAT_R32_SFLOAT, w, h, 1,
+                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                              VK_IMAGE_ASPECT_COLOR_BIT)
+            || !nvk_buffer_new(&s_xs_buf, (VkDeviceSize)w * h * 4u,
+                               VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0)) {
+        fprintf(stderr, LOGP "XR scene: no images %ux%u\n", w, h);
+        return 0;
+    }
+    fprintf(stderr, LOGP "XR scene: snapshot images %ux%u\n", w, h);
+    return 1;
+}
+
+static void xs_mark(RenderTarget *rt)
+{
+    int scene, shown;
+    if (!nvk_xr_scene_wanted || s_hdr || !rt)
+        return;
+    shown = rt == s_hdr_prt[0] || rt == s_hdr_prt[1];
+    if (!shown)
+        return;
+    scene = nv2a_pb_stream_tag() == HDR_TAG_SCENE;
+    if (!scene && s_xs_last_scene && !s_xs_have && rt->dt && rt->dt->im.img
+            && rt->im.format == RT_FORMAT && rt->dt->hw >= rt->hw && rt->dt->hh >= rt->hh
+            && xs_images(rt->hw, rt->hh)) {
+        VkImageCopy ic;
+        VkBufferImageCopy bc;
+        end_encoder();
+        ensure_cmd();
+        nvk_image_to(s_cmd, &rt->im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        nvk_image_to(s_cmd, &s_xs_col, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        memset(&ic, 0, sizeof ic);
+        ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ic.srcSubresource.layerCount = 1;
+        ic.dstSubresource = ic.srcSubresource;
+        ic.extent.width = rt->hw;
+        ic.extent.height = rt->hh;
+        ic.extent.depth = 1;
+        vkCmdCopyImage(s_cmd, rt->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s_xs_col.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &ic);
+        nvk_image_to(s_cmd, &rt->dt->im, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        memset(&bc, 0, sizeof bc);
+        bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        bc.imageSubresource.layerCount = 1;
+        bc.imageExtent.width = rt->hw;
+        bc.imageExtent.height = rt->hh;
+        bc.imageExtent.depth = 1;
+        vkCmdCopyImageToBuffer(s_cmd, rt->dt->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               s_xs_buf.buf, 1, &bc);
+        {
+            VkBufferMemoryBarrier bb;
+            memset(&bb, 0, sizeof bb);
+            bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            bb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            bb.srcQueueFamilyIndex = bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bb.buffer = s_xs_buf.buf;
+            bb.size = VK_WHOLE_SIZE;
+            vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, NULL, 1, &bb, 0, NULL);
+        }
+        nvk_image_to(s_cmd, &s_xs_dep, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vkCmdCopyBufferToImage(s_cmd, s_xs_buf.buf, s_xs_dep.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &bc);
+        s_xs_have = 1;
+        s_xs_w = rt->hw;
+        s_xs_h = rt->hh;
+    }
+    s_xs_last_scene = scene;
+}
+
+/* At the flip, after the window slot's copy: this frame's scene next to it. */
+static void xs_flip(void *slot, uint32_t w, uint32_t h)
+{
+    struct fbv_scene_img *s;
+    if (!nvk_xr_scene_wanted || !slot)
+        return;
+    s = fbv_slot_scene(slot, w, h);
+    if (s && s_xs_have && w <= s_xs_w && h <= s_xs_h) {
+        VkImageCopy ic;
+        memset(&ic, 0, sizeof ic);
+        ic.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        ic.srcSubresource.layerCount = 1;
+        ic.dstSubresource = ic.srcSubresource;
+        ic.extent.width = w;
+        ic.extent.height = h;
+        ic.extent.depth = 1;
+        nvk_image_to(s_cmd, &s_xs_col, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        nvk_image_to(s_cmd, &s_xs_dep, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        nvk_image_to(s_cmd, &s->col, VK_IMAGE_LAYOUT_GENERAL);
+        nvk_image_to(s_cmd, &s->dep, VK_IMAGE_LAYOUT_GENERAL);
+        vkCmdCopyImage(s_cmd, s_xs_col.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s->col.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+        vkCmdCopyImage(s_cmd, s_xs_dep.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       s->dep.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+        s->valid = 1;
+    } else if (s) {
+        s->valid = 0;
+    }
+    s_xs_have = 0;
+    s_xs_last_scene = 0;
+}
+
 static void vk_on_draw(const struct nv2a_pb_draw *d)
 {
     static uint32_t *idx;
@@ -6934,6 +7067,7 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         return;
     }
     SPM(VKS_SURFACE);
+    xs_mark(rt);           /* a headset's 3D: the scene before the HUD */
     build_stages();
     nv2a_ps_consts_fill(v, s_stage, &pc.b);
     float host_bias = nv2a_host_lod_bias();   /* RECOMP_GFX_LOD_BIAS; 0 by default */
@@ -9522,6 +9656,7 @@ static void vk_on_flip(uint32_t surface_offset, uint32_t pitch)
                 ic.extent.depth = 1;
                 vkCmdCopyImage(s_cmd, rt->im.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                slot->img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
+                xs_flip(slot, hcw, hch);
                 if (s_vf)
                     vt3 = now_ns();
                 /* The frame's last submit, unless a readback follows. */

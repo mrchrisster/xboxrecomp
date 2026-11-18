@@ -316,6 +316,17 @@ static void pad_claim(SDL_JoystickID id)
     for (int k = 0; k < PAD_OPEN_MAX; k++) {
         if (!g_open[k].c || g_open[k].id != id || g_open[k].port >= 0)
             continue;
+        /* A Quest's Touch controllers are also an Android gamepad (Meta's
+         * vendor 0x2833): in VR they come through OpenXR (video/
+         * xr_theater.c), so this second copy gets no port (GT3-revisited
+         * ignores them the same way). */
+        if (SDL_GameControllerGetVendor(g_open[k].c) == 0x2833 && xbox_InputXrSourceActive()) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "[INPUT] the headset's controllers as an Android gamepad: ignored"
+                        " (they come through OpenXR)\n");
+            return;
+        }
         pthread_mutex_lock(&g_pads_lock);
         for (int p = xbox_InputFirstPadPort(); p < XBOX_MAX_CONTROLLERS; p++) {
             if (!g_pads[p]) {
