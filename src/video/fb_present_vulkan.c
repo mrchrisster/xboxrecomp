@@ -160,6 +160,7 @@ static struct nvk_image s_hcomp;         /* the overlay before its encode (HDR) 
 /* The game picture's rectangle in the swapchain image, for the headset's
  * screen (the last frame's, when one has no new picture). */
 static int s_xr_rect[4];
+static int s_sc_sampled;     /* the swapchain images can be sampled (the headset's draw) */
 
 static int  hdr_wanted(void) { return nv2a_host_hdr_active(); }
 /* RECOMP_DEBUG=hdr with no HDR10 surface (a headless test): the HDR encode
@@ -1955,8 +1956,11 @@ static int make_swapchain(SDL_Window *win)
     ci.imageExtent = s_sc_ext;
     ci.imageArrayLayers = 1;
     s_sc_color = (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
+    s_sc_sampled = xrt_on() && (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT) != 0;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
                   | (s_sc_shots || xrt_on() ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)
+                  | (xrt_on() && (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT)
+                     ? VK_IMAGE_USAGE_SAMPLED_BIT : 0)
                   | (s_sc_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
@@ -3571,7 +3575,8 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         /* The headset's screen: the picture (and the overlay over it) into
          * the OpenXR quad, still in TRANSFER_DST after. */
         xrt_quad_record(cb, s_sc_img[idx], s_sc_fmt, s_xr_rect[0], s_xr_rect[1],
-                        s_xr_rect[2], s_xr_rect[3]);
+                        s_xr_rect[2], s_xr_rect[3], s_sc_sampled,
+                        s_sc_ext.width, s_sc_ext.height);
     if (shot) {
         VkBufferImageCopy bc;
         nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,

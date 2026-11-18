@@ -50,8 +50,10 @@ struct nvk_core;
 int  xrt_preinit(void);
 int  xrt_on(void);
 int  xrt_start(const struct nvk_core *C);
+/* sampled: img has SAMPLED usage (drawn, scaled to at most 1920 wide, by a
+ * render pass); else copied as it is. sw, sh: img's size. */
 void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt,
-                     int x, int y, int w, int h);
+                     int x, int y, int w, int h, int sampled, uint32_t sw, uint32_t sh);
 void xrt_quad_submitted(int ok);
 void xrt_shutdown(void);
 

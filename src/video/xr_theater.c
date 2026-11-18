@@ -25,6 +25,7 @@
 #include <SDL_system.h>
 
 #include "d3d/nv2a_vk_core.h"
+#include "d3d/nv2a_vk_glsl.h"
 #include "input/xinput_xbox.h"
 #include "input/touch_pad.h"
 #include "xr_theater.h"
@@ -113,6 +114,17 @@ static struct {
     pthread_mutex_t quad_mu;
     XrSwapchain quad;
     VkImage quad_img[MAXIMG];
+    VkImageView quad_view[MAXIMG];
+    /* the draw into it (GT3-revisited's lesson: a render pass, not a
+     * transfer copy, into a Quest swapchain image) */
+    int draw_ok;                 /* -1 failed: the copy instead */
+    VkPipelineLayout pl;
+    VkPipeline pipe;
+    VkDescriptorSetLayout dsl;
+    VkDescriptorPool dpool;
+    VkSampler smp;
+    struct { VkImage img; VkImageView view; VkDescriptorSet set; } src[MAXIMG];
+    int nsrc;
     uint32_t quad_n, quad_w, quad_h, quad_idx;
     VkFormat quad_fmt;
     int quad_acquired, quad_has_frame;
@@ -1180,35 +1192,289 @@ static void release_locked(XrSwapchain sc)
     xrReleaseSwapchainImage(sc, &ri);
 }
 
+/* ---- the draw: the presenter's image, sampled and scaled into the quad ---- */
+static const char k_vs[] =
+    "#version 450\n"
+    "layout(location = 0) out vec2 uv;\n"
+    "void main() {\n"
+    "    uv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+    "    gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n";
+/* The bytes are sRGB-encoded in a UNORM image: decoded here, encoded again
+ * by the sRGB attachment, so the filtering is the only change. */
+static const char k_fs[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+    "layout(push_constant) uniform P { vec4 r; } p;\n"
+    "layout(location = 0) in vec2 uv;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "vec3 lin(vec3 c) {\n"
+    "    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"
+    "}\n"
+    "void main() {\n"
+    "    o = vec4(lin(texture(t, p.r.xy + uv * p.r.zw).rgb), 1.0);\n"
+    "}\n";
+
+static VkShaderModule shader(enum nvk_stage st, const char *src)
+{
+    const uint32_t *w;
+    size_t n;
+    int compiled;
+    char err[1024];
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (!nvk_glsl_spirv(st, src, &w, &n, &compiled, err, sizeof err)) {
+        fprintf(stderr, LOGX "shader: %s\n", err);
+        return VK_NULL_HANDLE;
+    }
+    ci.codeSize = n * 4;
+    ci.pCode = w;
+    vkCreateShaderModule(X.C->dev, &ci, NULL, &m);
+    return m;
+}
+
+static int draw_init(VkFormat fmt)
+{
+    VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkDescriptorSetLayoutBinding b = {0};
+    VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+    VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAXIMG};
+    VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    VkShaderModule vs, fs;
+    VkPipelineShaderStageCreateInfo st[2];
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba = {0};
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo gp = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    VkResult r;
+
+    pr.colorAttachmentCount = 1;
+    pr.pColorAttachmentFormats = &fmt;
+    b.binding = 0;
+    b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b.descriptorCount = 1;
+    b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    dl.bindingCount = 1;
+    dl.pBindings = &b;
+    if (vkCreateDescriptorSetLayout(X.C->dev, &dl, NULL, &X.dsl) != VK_SUCCESS)
+        return 0;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &X.dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pc;
+    if (vkCreatePipelineLayout(X.C->dev, &plci, NULL, &X.pl) != VK_SUCCESS)
+        return 0;
+    dp.maxSets = MAXIMG;
+    dp.poolSizeCount = 1;
+    dp.pPoolSizes = &ps;
+    if (vkCreateDescriptorPool(X.C->dev, &dp, NULL, &X.dpool) != VK_SUCCESS)
+        return 0;
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 0.0f;
+    if (vkCreateSampler(X.C->dev, &sci, NULL, &X.smp) != VK_SUCCESS)
+        return 0;
+    vs = shader(NVK_STAGE_VERTEX, k_vs);
+    fs = shader(NVK_STAGE_FRAGMENT, k_fs);
+    if (!vs || !fs)
+        return 0;
+    memset(st, 0, sizeof st);
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    st[0].module = vs;
+    st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    st[1].module = fs;
+    st[1].pName = "main";
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    cba.colorWriteMask = 0xF;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cba;
+    ds.dynamicStateCount = 2;
+    ds.pDynamicStates = dyn;
+    gp.stageCount = 2;
+    gp.pStages = st;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vp;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pColorBlendState = &cb;
+    gp.pDynamicState = &ds;
+    gp.pNext = &pr;      /* dynamic rendering, as the rest of the presenter */
+    gp.layout = X.pl;
+    r = vkCreateGraphicsPipelines(X.C->dev, VK_NULL_HANDLE, 1, &gp, NULL, &X.pipe);
+    vkDestroyShaderModule(X.C->dev, vs, NULL);
+    vkDestroyShaderModule(X.C->dev, fs, NULL);
+    return r == VK_SUCCESS;
+}
+
+static VkImageView view_of(VkImage img, VkFormat fmt)
+{
+    VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    VkImageView v = VK_NULL_HANDLE;
+    vi.image = img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = fmt;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    vkCreateImageView(X.C->dev, &vi, NULL, &v);
+    return v;
+}
+
+/* The presenter's swapchain images, each with a view and a descriptor set,
+ * made at first sight (the swapchain is made again on a resize: new images,
+ * the old entries are dropped then). */
+static VkDescriptorSet src_set(VkImage img, VkFormat fmt)
+{
+    int i;
+    VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    VkDescriptorImageInfo ii;
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    for (i = 0; i < X.nsrc; i++)
+        if (X.src[i].img == img)
+            return X.src[i].set;
+    if (X.nsrc == MAXIMG) {     /* a new swapchain: start over */
+        vkResetDescriptorPool(X.C->dev, X.dpool, 0);
+        for (i = 0; i < X.nsrc; i++)
+            vkDestroyImageView(X.C->dev, X.src[i].view, NULL);
+        X.nsrc = 0;
+    }
+    i = X.nsrc;
+    X.src[i].img = img;
+    X.src[i].view = view_of(img, fmt);
+    ai.descriptorPool = X.dpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &X.dsl;
+    if (!X.src[i].view || vkAllocateDescriptorSets(X.C->dev, &ai, &X.src[i].set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    ii.sampler = X.smp;
+    ii.imageView = X.src[i].view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    w.dstSet = X.src[i].set;
+    w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(X.C->dev, 1, &w, 0, NULL);
+    X.nsrc++;
+    return X.src[i].set;
+}
+
 /* ---- the presenter's side ---- */
-void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y, int w, int h)
+/* The screen's size: the picture's, at most XR_MAX_W wide (the immersive
+ * window is the panel's 4128x2208; the game draws a fraction of that). */
+#define XR_MAX_W 1920
+
+void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y, int w, int h,
+                     int sampled, uint32_t sw, uint32_t sh)
 {
     VkImageCopy c;
     int64_t want;
+    uint32_t qw, qh, i;
+    int draw;
     if (!X.on || !X.session || w <= 0 || h <= 0 || X.quad_acquired)
         return;
-    want = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB) ? X.fmt_srgb_bgra : X.fmt_srgb;
+    if (X.draw_ok == 0 && sampled)
+        X.draw_ok = draw_init((VkFormat)X.fmt_srgb) ? 1 : -1;
+    draw = sampled && X.draw_ok > 0;
+    if (draw) {
+        want = X.fmt_srgb;
+        qw = (uint32_t)w > XR_MAX_W ? XR_MAX_W : (uint32_t)w;
+        qh = (uint32_t)(((uint64_t)h * qw + (uint32_t)w / 2) / (uint32_t)w);
+    } else {
+        want = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB) ? X.fmt_srgb_bgra : X.fmt_srgb;
+        qw = (uint32_t)w;
+        qh = (uint32_t)h;
+    }
     if (!want)
         return;      /* no matching format: a raw copy would swap the colours */
     pthread_mutex_lock(&X.quad_mu);
-    if (!X.quad || X.quad_w != (uint32_t)w || X.quad_h != (uint32_t)h || X.quad_fmt != (VkFormat)want) {
-        if (X.quad)
+    if (!X.quad || X.quad_w != qw || X.quad_h != qh || X.quad_fmt != (VkFormat)want) {
+        if (X.quad) {
+            vkQueueWaitIdle(X.C->queue);
+            for (i = 0; i < X.quad_n; i++) {
+                if (X.quad_view[i]) vkDestroyImageView(X.C->dev, X.quad_view[i], NULL);
+                X.quad_view[i] = VK_NULL_HANDLE;
+            }
             xrDestroySwapchain(X.quad);
+        }
         X.quad_has_frame = 0;
-        X.quad = make_sc(want, (uint32_t)w, (uint32_t)h,
+        X.quad = make_sc(want, qw, qh,
                          XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT
                          | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT);
         X.quad_n = X.quad ? enum_images(X.quad, X.quad_img) : 0;
-        X.quad_w = (uint32_t)w;
-        X.quad_h = (uint32_t)h;
+        X.quad_w = qw;
+        X.quad_h = qh;
         X.quad_fmt = (VkFormat)want;
+        if (draw)
+            for (i = 0; i < X.quad_n; i++)
+                X.quad_view[i] = view_of(X.quad_img[i], (VkFormat)want);
         update_size();
-        fprintf(stderr, LOGX "screen swapchain %dx%d (%s)\n", w, h, X.quad ? "made" : "FAILED");
+        fprintf(stderr, LOGX "screen swapchain %ux%u from a %dx%d picture, %s (%s)\n", qw, qh, w, h,
+                draw ? "drawn" : "copied", X.quad ? "made" : "FAILED");
     }
     pthread_mutex_unlock(&X.quad_mu);
     if (!X.quad || !acquire(X.quad, &X.quad_idx) || X.quad_idx >= X.quad_n)
         return;
     X.quad_acquired = 1;
+    if (draw && X.quad_view[X.quad_idx]) {
+        VkDescriptorSet set = src_set(src, fmt);
+        VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        VkRenderingInfo rb = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+        VkViewport v = {0, 0, (float)qw, (float)qh, 0, 1};
+        VkRect2D sc = {{0, 0}, {qw, qh}};
+        float r[4];
+        barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        barrier(cb, X.quad_img[X.quad_idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        ca.imageView = X.quad_view[X.quad_idx];
+        ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        rb.renderArea = sc;
+        rb.layerCount = 1;
+        rb.colorAttachmentCount = 1;
+        rb.pColorAttachments = &ca;
+        vkCmdBeginRendering(cb, &rb);
+        if (set) {
+            r[0] = (float)x / (float)sw;
+            r[1] = (float)y / (float)sh;
+            r[2] = (float)w / (float)sw;
+            r[3] = (float)h / (float)sh;
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.pipe);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.pl, 0, 1, &set, 0, NULL);
+            vkCmdPushConstants(cb, X.pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, r);
+            vkCmdSetViewport(cb, 0, 1, &v);
+            vkCmdSetScissor(cb, 0, 1, &sc);
+            vkCmdDraw(cb, 3, 1, 0, 0);
+        }
+        vkCmdEndRendering(cb);
+        barrier(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        return;
+    }
     barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1555,8 +1821,9 @@ void xrt_shutdown(void)
 int  xrt_preinit(void) { return 0; }
 int  xrt_on(void) { return 0; }
 int  xrt_start(const struct nvk_core *C) { (void)C; return 0; }
-void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y, int w, int h)
-{ (void)cb; (void)src; (void)fmt; (void)x; (void)y; (void)w; (void)h; }
+void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y, int w, int h,
+                     int sampled, uint32_t sw, uint32_t sh)
+{ (void)cb; (void)src; (void)fmt; (void)x; (void)y; (void)w; (void)h; (void)sampled; (void)sw; (void)sh; }
 void xrt_quad_submitted(int ok) { (void)ok; }
 void xrt_shutdown(void) {}
 
