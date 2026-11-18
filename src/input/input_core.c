@@ -559,6 +559,16 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
     RUMBLE_UNLOCK();
 }
 
+static int (*volatile g_xr_state)(XBOX_INPUT_STATE *out);
+static void (*volatile g_xr_rumble)(unsigned left, unsigned right);
+
+void xbox_InputSetXrSource(int (*state)(XBOX_INPUT_STATE *out),
+                           void (*rumble)(unsigned left, unsigned right))
+{
+    g_xr_state = state;
+    g_xr_rumble = rumble;
+}
+
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XBOX_INPUT_STATE kb, tp;
@@ -631,6 +641,31 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
             pState->dwPacketNumber += tp.dwPacketNumber;
         }
     }
+    /* A headset's Touch controllers (video/xr_theater.c), merged the same
+     * way: a button held by either, a trigger the larger, a stick moved. */
+    if (dwPort == 0 && g_xr_state) {
+        XBOX_INPUT_STATE xs;
+        int (*fn)(XBOX_INPUT_STATE *) = g_xr_state;
+        if (fn && fn(&xs)) {
+            if (any_held(&xs.Gamepad) || xs.Gamepad.sThumbLX || xs.Gamepad.sThumbLY)
+                src |= XBOX_INPUT_SRC_PAD;
+            if (rc != ERROR_SUCCESS) {
+                *pState = xs;
+                rc = ERROR_SUCCESS;
+            } else {
+                XBOX_GAMEPAD *g = &pState->Gamepad;
+                g->wButtons |= xs.Gamepad.wButtons;
+                for (int i = 0; i < 8; i++)
+                    if (xs.Gamepad.bAnalogButtons[i] > g->bAnalogButtons[i])
+                        g->bAnalogButtons[i] = xs.Gamepad.bAnalogButtons[i];
+                if (xs.Gamepad.sThumbLX) g->sThumbLX = xs.Gamepad.sThumbLX;
+                if (xs.Gamepad.sThumbLY) g->sThumbLY = xs.Gamepad.sThumbLY;
+                if (xs.Gamepad.sThumbRX) g->sThumbRX = xs.Gamepad.sThumbRX;
+                if (xs.Gamepad.sThumbRY) g->sThumbRY = xs.Gamepad.sThumbRY;
+                pState->dwPacketNumber += xs.dwPacketNumber;
+            }
+        }
+    }
     g_sources[dwPort] = src;
     if (rc == ERROR_SUCCESS && (g_blocked || (g_latched & (1u << dwPort)))) {
         if (!g_blocked && !any_held(&pState->Gamepad))
@@ -655,6 +690,8 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
     rumble_step(dwPort);
     g_rumble[dwPort].target[0] = pVibration->wLeftMotorSpeed;
     g_rumble[dwPort].target[1] = pVibration->wRightMotorSpeed;
+    if (dwPort == 0 && g_xr_rumble)
+        g_xr_rumble(pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
     rc = rumble_step(dwPort);
     RUMBLE_UNLOCK();
     return g_connected[dwPort] ? rc : ERROR_DEVICE_NOT_CONNECTED;

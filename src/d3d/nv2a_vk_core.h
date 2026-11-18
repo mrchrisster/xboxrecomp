@@ -99,6 +99,17 @@ void nvk_set_lost_handler(void (*fn)(const char *why));
 int  nvk_backend_quiesce(int timeout_ms);
 void nvk_core_shutdown(void);
 
+/* An OpenXR runtime (XR_KHR_vulkan_enable2, video/xr_theater.c) makes the
+ * instance and the device itself, adding what its compositor needs, and
+ * names the physical device: set before nvk_core_init, never changed after.
+ * NULL members keep the plain calls. */
+struct nvk_xr_hooks {
+    VkResult (*create_instance)(const VkInstanceCreateInfo *ci, VkInstance *out);
+    VkPhysicalDevice (*physical_device)(VkInstance inst);
+    VkResult (*create_device)(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, VkDevice *out);
+};
+void nvk_core_set_xr_hooks(const struct nvk_xr_hooks *h);
+
 void nvk_queue_lock(void);
 void nvk_queue_unlock(void);
 

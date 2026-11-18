@@ -65,6 +65,16 @@ static int fail(const char *fmt, const char *a, VkResult r)
     return 0;
 }
 
+static struct nvk_xr_hooks s_xr;
+
+void nvk_core_set_xr_hooks(const struct nvk_xr_hooks *h)
+{
+    if (h)
+        s_xr = *h;
+    else
+        memset(&s_xr, 0, sizeof s_xr);
+}
+
 static int make_instance(const char *const *inst_exts, unsigned n)
 {
     const char *exts[32];
@@ -152,7 +162,8 @@ static int make_instance(const char *const *inst_exts, unsigned n)
     ci.ppEnabledExtensionNames = exts;
     ci.enabledLayerCount = nl;
     ci.ppEnabledLayerNames = layers;
-    r = vkCreateInstance(&ci, NULL, &s_core.inst);
+    r = s_xr.create_instance ? s_xr.create_instance(&ci, &s_core.inst)
+                             : vkCreateInstance(&ci, NULL, &s_core.inst);
     if (r != VK_SUCCESS)
         return fail("vkCreateInstance failed%s: %s", "", r);
     return 1;
@@ -221,6 +232,18 @@ static int make_device(void)
             best = sc;
             s_core.phys = pds[i];
             best_q = q;
+        }
+    }
+    if (s_xr.physical_device) {
+        /* The headset's GPU, as its runtime names it. */
+        VkPhysicalDevice xp = s_xr.physical_device(s_core.inst);
+        uint32_t q = 0;
+        if (xp && device_score(xp, s_core.surface, &q) >= 0) {
+            s_core.phys = xp;
+            best_q = q;
+            best = best < 0 ? 1 : best;
+        } else if (xp) {
+            fprintf(stderr, "[vulkan] the OpenXR runtime's device has no usable queue\n");
         }
     }
     if (best < 0)
@@ -393,7 +416,8 @@ static int make_device(void)
     dci.pQueueCreateInfos = &qci;
     dci.enabledExtensionCount = ne;
     dci.ppEnabledExtensionNames = exts;
-    r = vkCreateDevice(s_core.phys, &dci, NULL, &s_core.dev);
+    r = s_xr.create_device ? s_xr.create_device(s_core.phys, &dci, &s_core.dev)
+                           : vkCreateDevice(s_core.phys, &dci, NULL, &s_core.dev);
     if (r != VK_SUCCESS)
         return fail("vkCreateDevice on %s failed: %s", s_core.name, r);
 #if defined(XR_VK_DYNAMIC)

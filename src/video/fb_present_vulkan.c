@@ -89,6 +89,7 @@ int xbox_VblankDisplayLockOn(void);
 uint32_t xbox_HostFlipIntervalAsked(void);
 #include "kernel/nv2a_backend_common.h"
 #include "fb_present_vulkan.h"
+#include "xr_theater.h"
 #include "surface_gate.h"
 #include "../platform/xr_log.h"   /* the print gate (also force-included) */
 
@@ -156,6 +157,10 @@ static int              s_hdr_offered;   /* the surface offers HDR10 */
 static VkFormat         s_hdr_fmt;       /* its format for that */
 static float            s_hdr_peak;      /* the display's peak, nits (its EDID or 1000) */
 static struct nvk_image s_hcomp;         /* the overlay before its encode (HDR) */
+/* The game picture's rectangle in the swapchain image, for the headset's
+ * screen (the last frame's, when one has no new picture). */
+static int s_xr_rect[4];
+
 static int  hdr_wanted(void) { return nv2a_host_hdr_active(); }
 /* RECOMP_DEBUG=hdr with no HDR10 surface (a headless test): the HDR encode
  * path runs anyway, into the SDR swapchain (wrong colours, true cost). */
@@ -1951,7 +1956,7 @@ static int make_swapchain(SDL_Window *win)
     ci.imageArrayLayers = 1;
     s_sc_color = (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                  | (s_sc_shots ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)
+                  | (s_sc_shots || xrt_on() ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0)
                   | (s_sc_color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
@@ -2051,6 +2056,7 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         free(names);
         return 0;
     }
+    xrt_preinit();   /* a headset: its runtime makes the device (xr_theater.h) */
     C = nvk_core_init(names, n, make_surface, win, err, errn);
     free(names);
     if (!C)
@@ -2095,6 +2101,8 @@ int fbv_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         snprintf(err, errn, "no swapchain for the window");
         return 0;
     }
+    if (xrt_on())
+        xrt_start(C);    /* the session and its frame thread */
     {
         const char *csv = recomp_env(RENV_VK_PRESENT_LOG);
         if (csv && strcmp(csv, "1") && (s_csv = fopen(csv, "w")) != NULL)
@@ -3433,6 +3441,12 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
         whole = nv2a_present_layout(sw, sh, (uint32_t)s_sc_ext.width,
                                     (uint32_t)s_sc_ext.height, filter, &sr, &r2);
         if (r2.w > 0 && r2.h > 0) {
+            s_xr_rect[0] = (int)r2.x;
+            s_xr_rect[1] = (int)r2.y;
+            s_xr_rect[2] = (int)r2.w;
+            s_xr_rect[3] = (int)r2.h;
+        }
+        if (r2.w > 0 && r2.h > 0) {
             int lin = filter == NV2A_PRESENT_LINEAR
                       || (filter == NV2A_PRESENT_INTEGER && !whole);
             VkImageBlit b;
@@ -3553,6 +3567,11 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             s_lat_pend[s_fi] = 1;
         }
     }
+    if (xrt_on() && !hdr && s_xr_rect[2] > 0)
+        /* The headset's screen: the picture (and the overlay over it) into
+         * the OpenXR quad, still in TRANSFER_DST after. */
+        xrt_quad_record(cb, s_sc_img[idx], s_sc_fmt, s_xr_rect[0], s_xr_rect[1],
+                        s_xr_rect[2], s_xr_rect[3]);
     if (shot) {
         VkBufferImageCopy bc;
         nvk_image_barrier(cb, s_sc_img[idx], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -3649,6 +3668,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
                  s_sc_ext.width, s_sc_ext.height);
         nvk_submit_note(what);
     }
+    xrt_quad_submitted(r == VK_SUCCESS);   /* under the queue lock, as OpenXR wants */
     pr = r == VK_SUCCESS ? vkQueuePresentKHR(C->queue, &pi) : r;
     nvk_queue_unlock();
     if (r == VK_SUCCESS) {

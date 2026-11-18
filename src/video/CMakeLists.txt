@@ -44,6 +44,18 @@ else()
             # The 60 fps frame rate and the ADPF performance hints.
             target_sources(xbox_video PRIVATE android_perf.c)
             target_link_libraries(xbox_video PUBLIC android)
+            # Meta Quest: the game on a floating OpenXR screen (xr_theater.c),
+            # with the Khronos loader from XBOXRECOMP_OPENXR_DIR (its include/
+            # and lib/arm64-v8a/libopenxr_loader.so). Off without it.
+            if(XBOXRECOMP_OPENXR_DIR)
+                target_sources(xbox_video PRIVATE xr_theater.c)
+                target_compile_definitions(xbox_video PUBLIC XBOXRECOMP_XR=1)
+                target_include_directories(xbox_video PRIVATE ${XBOXRECOMP_OPENXR_DIR}/include)
+                target_link_libraries(xbox_video PUBLIC
+                    ${XBOXRECOMP_OPENXR_DIR}/lib/arm64-v8a/libopenxr_loader.so)
+            else()
+                target_sources(xbox_video PRIVATE xr_theater.c)
+            endif()
         endif()
     endif()
     if(APPLE)

@@ -108,6 +108,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState);
  * under its idle hum, the strength, and a release when a speed falls.
  */
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
+/* A headset's controllers as port 0 (video/xr_theater.c): state() fills the
+ * pad and returns 1 while they are in use; rumble() gets port 0's motor
+ * speeds as the title sets them. Merged like the on-screen controls. NULLs
+ * remove it. */
+void xbox_InputSetXrSource(int (*state)(XBOX_INPUT_STATE *out),
+                           void (*rumble)(unsigned left, unsigned right));
 
 /**
  * The rumble's clock: moves a port's falling motors on and re-issues a held
