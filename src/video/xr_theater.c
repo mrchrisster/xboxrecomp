@@ -358,6 +358,7 @@ int xrt_preinit(void)
         return 0;
     }
     nvk_core_set_xr_hooks(&hooks);
+    xbox_InputTouchForceOff(1);   /* no on-screen controls in the headset */
     X.on = 1;
     fprintf(stderr, LOGX "OpenXR instance up (passthrough %d, refresh %d, touch plus %d): the Vulkan device"
             " comes from the runtime\n", X.ext_passthrough, X.ext_refresh, X.ext_touch_plus);

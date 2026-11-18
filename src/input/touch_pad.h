@@ -58,6 +58,8 @@ enum { XBOX_TOUCH_AUTO, XBOX_TOUCH_ALWAYS, XBOX_TOUCH_OFF };
  * the screen's height times this). Auto-gas: the right trigger is held
  * while driving unless BRAKE is. */
 void xbox_InputTouchSetMode(int mode);
+/* Off for good, the setting notwithstanding (a VR headset). */
+void xbox_InputTouchForceOff(int on);
 int  xbox_InputTouchMode(void);
 void xbox_InputTouchSetOpacity(float opacity);
 void xbox_InputTouchSetScale(float scale);

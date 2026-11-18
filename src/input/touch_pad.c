@@ -90,9 +90,20 @@ static DWORD g_pkt;
 
 /* ── settings ─────────────────────────────────────────────────────── */
 
+/* A headset (video/xr_theater.c): no touch screen to show controls on,
+ * whatever the setting says. */
+static volatile int g_forced_off;
+
+void xbox_InputTouchForceOff(int on)
+{
+    g_forced_off = on;
+    if (on)
+        g_mode = XBOX_TOUCH_OFF;
+}
+
 void xbox_InputTouchSetMode(int mode)
 {
-    if (mode < XBOX_TOUCH_AUTO || mode > XBOX_TOUCH_OFF)
+    if (mode < XBOX_TOUCH_AUTO || mode > XBOX_TOUCH_OFF || g_forced_off)
         mode = XBOX_TOUCH_OFF;
     g_mode = mode;
 }

@@ -744,6 +744,8 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
      * not read for a probe interval is asked here. */
     if (g_be->now_ms() - g_last_probe[dwPort] >= XBOX_INPUT_PROBE_MS)
         probe(dwPort, &st);
+    if (dwPort == 0 && !g_connected[0] && g_xr_state)
+        return TRUE;       /* a headset's controllers are player 1 */
     return g_connected[dwPort];
 }
 
