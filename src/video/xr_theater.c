@@ -192,6 +192,18 @@ static PFN_xrVoidFunction xr_fn(const char *name)
 }
 
 /* ---- the Vulkan instance and device, made by the runtime (enable2) ---- */
+
+/* The runtime makes them through this: vkCreateInstance and vkCreateDevice
+ * are the toolkit's own (d3d/vk_dyn.c fills its function pointers in them,
+ * from the new instance and device), everything else the loader's. */
+static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL xr_gipa(VkInstance inst, const char *name)
+{
+    if (!strcmp(name, "vkCreateInstance"))
+        return (PFN_vkVoidFunction)vkCreateInstance;
+    if (!strcmp(name, "vkCreateDevice") && inst)
+        return (PFN_vkVoidFunction)vkCreateDevice;
+    return vkGetInstanceProcAddr(inst, name);
+}
 static VkResult hook_instance(const VkInstanceCreateInfo *ci, VkInstance *out)
 {
     PFN_xrCreateVulkanInstanceKHR mk = (PFN_xrCreateVulkanInstanceKHR)xr_fn("xrCreateVulkanInstanceKHR");
@@ -209,7 +221,7 @@ static VkResult hook_instance(const VkInstanceCreateInfo *ci, VkInstance *out)
             (unsigned)XR_VERSION_MAJOR(rq.minApiVersionSupported), (unsigned)XR_VERSION_MINOR(rq.minApiVersionSupported),
             (unsigned)XR_VERSION_MAJOR(rq.maxApiVersionSupported), (unsigned)XR_VERSION_MINOR(rq.maxApiVersionSupported));
     xi.systemId = X.sys;
-    xi.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xi.pfnGetInstanceProcAddr = xr_gipa;
     xi.vulkanCreateInfo = ci;
     r = mk(X.inst, &xi, out, &vr);
     if (XR_FAILED(r)) {
@@ -242,7 +254,7 @@ static VkResult hook_device(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, V
     if (!mk)
         return VK_ERROR_INITIALIZATION_FAILED;
     xd.systemId = X.sys;
-    xd.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xd.pfnGetInstanceProcAddr = xr_gipa;
     xd.vulkanPhysicalDevice = pd;
     xd.vulkanCreateInfo = ci;
     r = mk(X.inst, &xd, out, &vr);
