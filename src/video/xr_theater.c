@@ -1442,7 +1442,14 @@ static const char k_sfs[] =
     "    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"
     "}\n"
     "vec2 S(vec2 u) { return p.rs.xy + clamp(u, 0.0, 1.0) * p.rs.zw; }\n"
-    "float D(vec2 u) { return texture(dep, S(u)).r; }\n"
+    /* the nearest of three texels across: foreground edges a little wider,
+     * so the background does not show through as slivers beside thin
+     * near things (fence posts) */
+    "float D(vec2 u) {\n"
+    "    vec2 t = S(u);\n"
+    "    float dx = 1.5 / float(textureSize(dep, 0).x);\n"
+    "    return min(texture(dep, t).r, min(texture(dep, t + vec2(dx, 0.0)).r, texture(dep, t - vec2(dx, 0.0)).r));\n"
+    "}\n"
     "bool hud(vec2 u) {\n"
     "    vec3 d = abs(texture(frm, S(u)).rgb - texture(scn, S(u)).rgb);\n"
     "    return max(d.r, max(d.g, d.b)) > p.st.z;\n"
