@@ -1454,13 +1454,38 @@ static const char k_sfs[] =
     "    vec3 d = abs(texture(frm, S(u)).rgb - texture(scn, S(u)).rgb);\n"
     "    return max(d.r, max(d.g, d.b)) > p.st.z;\n"
     "}\n"
+    "float D1(vec2 u) { return texture(dep, S(u)).r; }\n"
     "void main() {\n"
-    "    float f = (D(vec2(0.5, 0.62)) + D(vec2(0.42, 0.68)) + D(vec2(0.58, 0.68))) / 3.0;\n"
+    "    float f = (D1(vec2(0.5, 0.62)) + D1(vec2(0.42, 0.68)) + D1(vec2(0.58, 0.68))) / 3.0;\n"
     "    f = min(f, 0.99999);\n"
-    "    float s = uv.x;\n"
-    "    for (int i = 0; i < 4; i++) {\n"
-    "        float k = clamp((D(vec2(s, uv.y)) - f) / max(1.0 - f, 1e-6), -p.st.y, 1.0);\n"
-    "        s = uv.x - p.st.x * k;\n"
+    "    float a = p.st.x, pop = p.st.y;\n"
+    /* the inverse warp: the source pixels whose shifted place is this one,
+     * the nearest of them (the front surface); none is a hole (background
+     * uncovered), filled by the fixed-point lookup from the far side */
+    "    float sh0 = a, sh1 = -a * pop;\n"
+    "    float lo = uv.x - max(sh0, sh1), hi = uv.x - min(sh0, sh1);\n"
+    "    const int N = 24;\n"
+    "    float step_ = max((hi - lo) / float(N), 1e-6);\n"
+    "    float best = -1.0, bestd = 2.0;\n"
+    /* away from depth edges one shift serves the whole range: the cheap
+     * fixed-point lookup; the search only where the range crosses an edge */
+    "    float e0 = D1(vec2(lo, uv.y)), e1 = D1(vec2(0.5 * (lo + hi), uv.y)), e2 = D1(vec2(hi, uv.y));\n"
+    "    bool edge = max(e0, max(e1, e2)) - min(e0, min(e1, e2)) > 0.0012 * max(1.0 - f, 1e-4);\n"
+    "    for (int j = 0; j < N && edge; j++) {\n"
+    "        float s = lo + (float(j) + 0.5) * step_;\n"
+    /* the widened depth: a soft edge's pixels (the post's colour over
+     * the background's depth) go with the post, not with what is behind */
+    "        float d = D(vec2(s, uv.y));\n"
+    "        float k = clamp((d - f) / max(1.0 - f, 1e-6), -pop, 1.0);\n"
+    "        if (abs(s + a * k - uv.x) <= step_ * 0.75 && d < bestd) { bestd = d; best = s; }\n"
+    "    }\n"
+    "    float s = best;\n"
+    "    if (s < 0.0) {\n"
+    "        s = uv.x;\n"
+    "        for (int i = 0; i < 4; i++) {\n"
+    "            float k = clamp(((edge ? D(vec2(s, uv.y)) : D1(vec2(s, uv.y))) - f) / max(1.0 - f, 1e-6), -pop, 1.0);\n"
+    "            s = uv.x - a * k;\n"
+    "        }\n"
     "    }\n"
     "    vec2 su = vec2(clamp(s, 0.0, 1.0), uv.y);\n"
     "    vec3 c;\n"
