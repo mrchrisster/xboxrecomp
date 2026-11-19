@@ -93,7 +93,9 @@ static XrQuaternionf facing(V3 dir)
 #define PROJ_DIM 64
 #define MAXIMG 8
 
-enum { M_RESUME, M_MODE, M_BACKGROUND, M_3D, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
+enum { M_RESUME, M_MODE, M_LEVEL, M_FILL, M_BACKGROUND, M_3D, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
+static const char *const k_fill_name[3] = {"16:9", "4:3", "FULL"};
+static const float k_fill_aspect[3] = {0.0f, 0.75f, 1.0f};
 
 /* 3D depth levels: the shift at infinity, in picture widths (Futurama's
  * 0.022 clip-space units x its 1 / 1.6 / 2.3 scale, halved for uv). */
@@ -143,7 +145,14 @@ static struct {
     XrVector3f org_pos;          /* the re-centred origin: the head's place and heading */
     XrQuaternionf org_q;         /* heading only */
     int org_valid;
-    struct { XrView v[2]; float tanh; } pring[64];
+    struct { XrView v[2]; float tanh, tanv; } pring[64];
+    int level, fill;             /* level horizon; the picture: 0 the game's, 1 4:3, 2 full */
+    XrSwapchain hud_sc;          /* the HUD's own panel (head-tracked mode) */
+    VkImage hud_img[MAXIMG];
+    VkImageView hud_view[MAXIMG];
+    uint32_t hud_n, hud_idx;
+    int hud_acquired, hud_has, hud_pending;
+    VkPipeline hpipe;
     uint32_t pose_id;            /* the last index handed out (0 = none yet) */
     uint32_t quad_pose_pending, quad_pose_id;   /* the quad's picture's pose index */
     uint64_t imm_frames, imm_noposes;
@@ -426,6 +435,7 @@ static void load_view(void)
     X.elev = DEF_ELEV;
     X.dark = DEF_DARK;
     X.depth_level = 1;
+    X.level = 1;                 /* level horizon on by default: steadier */
     if (!dir)
         return;
     snprintf(X.prefs, sizeof X.prefs, "%s/xr_view.txt", dir);
@@ -434,12 +444,16 @@ static void load_view(void)
         return;
     X.depth_level = 1;
     if (fscanf(f, "%7s %f %f %f %d", tag, &d, &h, &e, &dk) == 5
-            && (!strcmp(tag, "t1") || !strcmp(tag, "t2") || !strcmp(tag, "t3"))) {
-        int lv = 1, im = 0;
+            && (!strcmp(tag, "t1") || !strcmp(tag, "t2") || !strcmp(tag, "t3") || !strcmp(tag, "t4"))) {
+        int lv = 1, im = 0, le = 1, fi = 0;
         if (strcmp(tag, "t1") && fscanf(f, "%d", &lv) == 1)
             X.depth_level = lv < 0 ? 0 : lv > 3 ? 3 : lv;
-        if (!strcmp(tag, "t3") && fscanf(f, "%d", &im) == 1)
+        if ((!strcmp(tag, "t3") || !strcmp(tag, "t4")) && fscanf(f, "%d", &im) == 1)
             X.immersive = im != 0;
+        if (!strcmp(tag, "t4") && fscanf(f, "%d %d", &le, &fi) == 2) {
+            X.level = le != 0;
+            X.fill = fi < 0 ? 0 : fi > 2 ? 2 : fi;
+        }
         X.dist = clampf(d, MIN_DIST, MAX_DIST);
         X.height = clampf(h, MIN_H, MAX_H);
         X.elev = clampf(e, -1.2f, 1.2f);
@@ -456,7 +470,8 @@ static void save_view(void)
     X.view_dirty = 0;
     if (!X.prefs[0] || !(f = fopen(X.prefs, "w")))
         return;
-    fprintf(f, "t3 %.3f %.3f %.3f %d %d %d\n", X.dist, X.height, X.elev, X.dark, X.depth_level, X.immersive);
+    fprintf(f, "t4 %.3f %.3f %.3f %d %d %d %d %d\n", X.dist, X.height, X.elev, X.dark, X.depth_level, X.immersive,
+            X.level, X.fill);
     fclose(f);
 }
 
@@ -532,6 +547,20 @@ static XrQuaternionf qconj(XrQuaternionf q) { q.x = -q.x; q.y = -q.y; q.z = -q.z
 
 int xrt_immersive(void) { return X.on && X.running && X.immersive && X.org_valid && X.lvalid; }
 
+void xrt_immersive_opts(int *level, float *aspect)
+{
+    *level = X.level;
+    *aspect = k_fill_aspect[X.fill];
+}
+
+void xrt_pose_set_tanv(uint32_t id, float tanv)
+{
+    pthread_mutex_lock(&X.pose_mu);
+    if (id && X.pring[id % 64].tanh > 0.0f)
+        X.pring[id % 64].tanv = tanv;
+    pthread_mutex_unlock(&X.pose_mu);
+}
+
 uint32_t xrt_pose_take(float q[4], float p[3], float *tan_half_h)
 {
     XrQuaternionf r, c0;
@@ -552,6 +581,7 @@ uint32_t xrt_pose_take(float q[4], float p[3], float *tan_half_h)
         t = fmaxf(t, fmaxf(a, b));
     }
     X.pring[id % 64].tanh = t;
+    X.pring[id % 64].tanv = 0.0f;   /* the game says (xrt_pose_set_tanv) */
     c0 = qconj(X.org_q);
     r = qmul(c0, X.lhead.orientation);
     d = qrot(c0, vsub(X.lhead.position, X.org_pos));
@@ -677,20 +707,21 @@ static int mwidth(const char *t, int s) { return (int)strlen(t) * 6 * s - s; }
 
 static void draw_menu(uint8_t *img)
 {
-    static const char *labels[M_COUNT] = {"RESUME", "MODE", "BACKGROUND", "3D DEPTH", "RECENTER", "RESET SCREEN",
-                                          "EXIT GAME"};
+    static const char *labels[M_COUNT] = {"RESUME", "MODE", "LEVEL HORIZON", "VIEW", "BACKGROUND", "3D DEPTH",
+                                          "RECENTER", "RESET SCREEN", "EXIT GAME"};
     const char *values[M_COUNT] = {"", X.immersive ? "IMMERSIVE (BETA)" : "SCREEN",
+                                   X.level ? "ON" : "OFF", k_fill_name[X.fill],
                                    X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY",
                                    k_depth_name[X.depth_level], "", "", X.exit_armed ? "PRESS A AGAIN" : ""};
-    const int band = 170, top = band + 6 + 40;
+    const int band = 150, top = band + 6 + 26;
     int i;
     mfill(img, 0, 0, MENU_W, MENU_H, 0xF26B1DFFu);              /* orange border */
     mfill(img, 6, 6, MENU_W - 12, MENU_H - 12, 0x101014FFu);     /* dark panel */
     mfill(img, 6, 6, MENU_W - 12, band, 0x2A0F08FFu);            /* header band */
-    mtext(img, (MENU_W - mwidth("BURNOUT 3", 12)) / 2, 6 + 22, 12, 0xF26B1DFFu, "BURNOUT 3");
-    mtext(img, (MENU_W - mwidth("TAKEDAWN VR", 4)) / 2, 6 + 22 + 96, 4, 0xFFD24AFFu, "TAKEDAWN VR");
+    mtext(img, (MENU_W - mwidth("BURNOUT 3", 12)) / 2, 6 + 16, 12, 0xF26B1DFFu, "BURNOUT 3");
+    mtext(img, (MENU_W - mwidth("TAKEDAWN VR", 4)) / 2, 6 + 16 + 90, 4, 0xFFD24AFFu, "TAKEDAWN VR");
     for (i = 0; i < M_COUNT; i++) {
-        int y = top + i * 58, sel = i == X.menu_sel;
+        int y = top + i * 50, sel = i == X.menu_sel;
         uint32_t fg = sel ? 0x101014FFu : 0xFFFFFFFFu;
         if (sel)
             mfill(img, 20, y - 10, MENU_W - 40, 58, 0xF26B1DFFu);
@@ -729,6 +760,14 @@ static void menu_activate(int dir)
         nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
         X.recenter = 1;
         fprintf(stderr, LOGX "mode: %s\n", X.immersive ? "immersive (head-tracked)" : "screen");
+        save_view();
+        break;
+    case M_LEVEL:
+        X.level = !X.level;
+        save_view();
+        break;
+    case M_FILL:
+        X.fill = (X.fill + (dir < 0 ? 2 : 1)) % 3;
         save_view();
         break;
     case M_BACKGROUND:
@@ -1575,10 +1614,30 @@ static const char k_sfs[] =
     "    }\n"
     "    vec2 su = vec2(clamp(s, 0.0, 1.0), uv.y);\n"
     "    vec3 c;\n"
-    "    if (hud(uv)) c = texture(fin, p.rf.xy + uv * p.rf.zw).rgb;\n"
+    /* head-tracked: the HUD is on its own panel, never in the eyes */
+    "    if (phys) c = hud(su) ? texture(scn, S(su)).rgb : texture(fin, p.rf.xy + su * p.rf.zw).rgb;\n"
+    "    else if (hud(uv)) c = texture(fin, p.rf.xy + uv * p.rf.zw).rgb;\n"
     "    else if (hud(su)) c = texture(scn, S(su)).rgb;\n"
     "    else c = texture(fin, p.rf.xy + su * p.rf.zw).rgb;\n"
     "    o = vec4(lin(c), 1.0);\n"
+    "}\n";
+
+/* The head-tracked mode's HUD panel: the frame's pixels the scene lacks,
+ * the rest transparent. */
+static const char k_hfs[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 1) uniform sampler2D frm;\n"
+    "layout(set = 0, binding = 2) uniform sampler2D scn;\n"
+    "layout(push_constant) uniform P { vec4 rf; vec4 rs; vec4 st; vec4 ph; } p;\n"
+    "layout(location = 0) in vec2 uv;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "vec3 lin(vec3 c) {\n"
+    "    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c));\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 t = p.rs.xy + uv * p.rs.zw;\n"
+    "    vec3 a = texture(frm, t).rgb, d = abs(a - texture(scn, t).rgb);\n"
+    "    o = max(d.r, max(d.g, d.b)) > p.st.z ? vec4(lin(a), 1.0) : vec4(0.0);\n"
     "}\n";
 
 static int sdraw_init(VkFormat fmt)
@@ -1671,8 +1730,17 @@ static int sdraw_init(VkFormat fmt)
     gp.pDynamicState = &ds;
     gp.layout = X.spl;
     r = vkCreateGraphicsPipelines(X.C->dev, VK_NULL_HANDLE, 1, &gp, NULL, &X.spipe);
-    vkDestroyShaderModule(X.C->dev, vs, NULL);
     vkDestroyShaderModule(X.C->dev, fs, NULL);
+    if (r == VK_SUCCESS) {   /* the HUD panel's: same layout and set */
+        VkShaderModule hs = shader(NVK_STAGE_FRAGMENT, k_hfs);
+        if (hs) {
+            st[1].module = hs;
+            if (vkCreateGraphicsPipelines(X.C->dev, VK_NULL_HANDLE, 1, &gp, NULL, &X.hpipe) != VK_SUCCESS)
+                X.hpipe = VK_NULL_HANDLE;
+            vkDestroyShaderModule(X.C->dev, hs, NULL);
+        }
+    }
+    vkDestroyShaderModule(X.C->dev, vs, NULL);
     return r == VK_SUCCESS;
 }
 
@@ -1731,6 +1799,55 @@ static VkDescriptorSet ssrc_set(VkImage src, VkFormat fmt, const struct xrt_scen
     vkUpdateDescriptorSets(X.C->dev, 4, w, 0, NULL);
     X.nssrc++;
     return X.ssrc[i].set;
+}
+
+/* The head-tracked mode's HUD panel: 1280x720, its own swapchain. */
+#define HUD_W 1280
+#define HUD_H 720
+static void hud_pass(VkCommandBuffer cb, VkDescriptorSet set, const struct xrt_scene *s)
+{
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingInfo rb = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    VkViewport v = {0, 0, (float)HUD_W, (float)HUD_H, 0, 1};
+    VkRect2D sc = {{0, 0}, {HUD_W, HUD_H}};
+    float pc[16];
+    uint32_t i;
+    if (!X.hud_sc) {
+        X.hud_sc = make_sc(X.fmt_srgb, HUD_W, HUD_H, XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
+                                                     | XR_SWAPCHAIN_USAGE_SAMPLED_BIT);
+        X.hud_n = X.hud_sc ? enum_images(X.hud_sc, X.hud_img) : 0;
+        for (i = 0; i < X.hud_n; i++)
+            X.hud_view[i] = view_of(X.hud_img[i], (VkFormat)X.fmt_srgb);
+        fprintf(stderr, LOGX "HUD panel swapchain %dx%d (%s)\n", HUD_W, HUD_H, X.hud_sc ? "made" : "FAILED");
+    }
+    if (!X.hud_sc || X.hud_acquired || !acquire(X.hud_sc, &X.hud_idx) || X.hud_idx >= X.hud_n)
+        return;
+    X.hud_acquired = 1;
+    memset(pc, 0, sizeof pc);
+    pc[4] = (float)s->rect[0] / (float)s->w;
+    pc[5] = (float)s->rect[1] / (float)s->h;
+    pc[6] = (float)s->rect[2] / (float)s->w;
+    pc[7] = (float)s->rect[3] / (float)s->h;
+    pc[10] = 3.0f / 255.0f;
+    barrier(cb, X.hud_img[X.hud_idx], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+    ca.imageView = X.hud_view[X.hud_idx];
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    rb.renderArea = sc;
+    rb.layerCount = 1;
+    rb.colorAttachmentCount = 1;
+    rb.pColorAttachments = &ca;
+    vkCmdBeginRendering(cb, &rb);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.hpipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spl, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, X.spl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+    vkCmdSetViewport(cb, 0, 1, &v);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
 }
 
 /* ---- the presenter's side ---- */
@@ -1892,6 +2009,8 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
         barrier(cb, src, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        if (sset && X.immersive && scene->pose && X.hpipe)
+            hud_pass(cb, sset, scene);
         return;
     }
     barrier(cb, src, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -1927,6 +2046,12 @@ void xrt_quad_submitted(int ok)
         return;
     X.quad_acquired = 0;
     release_locked(X.quad);   /* the caller holds nvk_queue_lock */
+    if (X.hud_acquired) {
+        X.hud_acquired = 0;
+        release_locked(X.hud_sc);
+        if (ok)
+            X.hud_has = 1;
+    }
     if (ok) {
         X.quad_has_frame = 1;
         X.quad_pose_id = X.quad_pose_pending;
@@ -1990,6 +2115,7 @@ static void end_frame(void)
     XrCompositionLayerProjectionView iv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                               {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     XrCompositionLayerProjection ip = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    XrCompositionLayerQuad hl = {XR_TYPE_COMPOSITION_LAYER_QUAD};
     if (imm)
         mr = 0;
 
@@ -2076,7 +2202,8 @@ static void end_frame(void)
         float th, tv;
         pthread_mutex_lock(&X.pose_mu);
         th = X.pring[id % 64].tanh;
-        tv = th * (float)X.quad_h / (float)(X.quad_w ? X.quad_w : 1);   /* the picture's aspect */
+        tv = X.pring[id % 64].tanv > 0.0f ? X.pring[id % 64].tanv
+           : th * (float)X.quad_h / (float)(X.quad_w ? X.quad_w : 1);   /* as the game drew it */
         for (e2 = 0; e2 < 2; e2++) {
             iv[e2].pose = X.pring[id % 64].v[e2].pose;
             iv[e2].fov.angleLeft = -atanf(th);
@@ -2094,6 +2221,28 @@ static void end_frame(void)
         ip.views = iv;
         layers[nl++] = (const XrCompositionLayerBaseHeader *)&ip;
         X.imm_frames++;
+        if (X.hud_sc && X.hud_has) {
+            /* the HUD panel: 1.1 m ahead of the seat, 0.2 m below the eyes,
+             * tipped back to face them (GT3 Revisited's hud_distance/drop) */
+            const float tip = 0.18f;
+            XrQuaternionf qt = {sinf(tip * 0.5f), 0.0f, 0.0f, cosf(tip * 0.5f)};
+            V3 fwd, at;
+            pthread_mutex_lock(&X.pose_mu);
+            fwd = qrot(X.org_q, v3(0, 0, -1));
+            at = vadd(X.org_pos, vadd(vmul(fwd, 1.1f), v3(0, -0.2f, 0)));
+            hl.pose.orientation = qmul(X.org_q, qt);
+            pthread_mutex_unlock(&X.pose_mu);
+            hl.pose.position = at;
+            hl.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+            hl.space = X.local;
+            hl.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            hl.subImage.swapchain = X.hud_sc;
+            hl.subImage.imageRect.extent.width = HUD_W;
+            hl.subImage.imageRect.extent.height = HUD_H;
+            hl.size.width = 1.25f;
+            hl.size.height = 1.25f * (float)HUD_H / (float)HUD_W;
+            layers[nl++] = (const XrCompositionLayerBaseHeader *)&hl;
+        }
     } else if (X.quad && X.quad_has_frame && X.fs.shouldRender) {
         if (X.ext_layer_settings) {
             qs.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB
