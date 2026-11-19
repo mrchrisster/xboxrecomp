@@ -93,7 +93,7 @@ static XrQuaternionf facing(V3 dir)
 #define PROJ_DIM 64
 #define MAXIMG 8
 
-enum { M_RESUME, M_BACKGROUND, M_3D, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
+enum { M_RESUME, M_MODE, M_BACKGROUND, M_3D, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
 
 /* 3D depth levels: the shift at infinity, in picture widths (Futurama's
  * 0.022 clip-space units x its 1 / 1.6 / 2.3 scale, halved for uv). */
@@ -134,6 +134,19 @@ static struct {
     struct { VkImage img; VkImageView fv, sv, dv; VkDescriptorSet set; } ssrc[16];
     int nssrc;
     uint64_t frames3d, frames2d;
+    /* head-tracked mode (MODE: IMMERSIVE) */
+    int immersive;
+    pthread_mutex_t pose_mu;
+    XrView lv[2];                /* the latest located views (predicted display time) */
+    XrPosef lhead;               /* and the head (VIEW space in LOCAL) */
+    int lvalid;
+    XrVector3f org_pos;          /* the re-centred origin: the head's place and heading */
+    XrQuaternionf org_q;         /* heading only */
+    int org_valid;
+    struct { XrView v[2]; float tanh; } pring[64];
+    uint32_t pose_id;            /* the last index handed out (0 = none yet) */
+    uint32_t quad_pose_pending, quad_pose_id;   /* the quad's picture's pose index */
+    uint64_t imm_frames, imm_noposes;
     VkPipelineLayout pl;
     VkPipeline pipe;
     VkDescriptorSetLayout dsl;
@@ -420,10 +433,13 @@ static void load_view(void)
     if (!f)
         return;
     X.depth_level = 1;
-    if (fscanf(f, "%7s %f %f %f %d", tag, &d, &h, &e, &dk) == 5 && (!strcmp(tag, "t1") || !strcmp(tag, "t2"))) {
-        int lv = 1;
-        if (!strcmp(tag, "t2") && fscanf(f, "%d", &lv) == 1)
+    if (fscanf(f, "%7s %f %f %f %d", tag, &d, &h, &e, &dk) == 5
+            && (!strcmp(tag, "t1") || !strcmp(tag, "t2") || !strcmp(tag, "t3"))) {
+        int lv = 1, im = 0;
+        if (strcmp(tag, "t1") && fscanf(f, "%d", &lv) == 1)
             X.depth_level = lv < 0 ? 0 : lv > 3 ? 3 : lv;
+        if (!strcmp(tag, "t3") && fscanf(f, "%d", &im) == 1)
+            X.immersive = im != 0;
         X.dist = clampf(d, MIN_DIST, MAX_DIST);
         X.height = clampf(h, MIN_H, MAX_H);
         X.elev = clampf(e, -1.2f, 1.2f);
@@ -440,7 +456,7 @@ static void save_view(void)
     X.view_dirty = 0;
     if (!X.prefs[0] || !(f = fopen(X.prefs, "w")))
         return;
-    fprintf(f, "t2 %.3f %.3f %.3f %d %d\n", X.dist, X.height, X.elev, X.dark, X.depth_level);
+    fprintf(f, "t3 %.3f %.3f %.3f %d %d %d\n", X.dist, X.height, X.elev, X.dark, X.depth_level, X.immersive);
     fclose(f);
 }
 
@@ -488,7 +504,62 @@ static void do_recenter(XrTime t)
     dir = v3(fx * ce, se, fz * ce);
     X.quad_pose.position = vadd(loc.pose.position, vmul(dir, X.dist));
     X.quad_pose.orientation = facing(dir);
+    {   /* the head-tracked mode's origin: here, facing this way (heading only) */
+        float yaw = atan2f(-fx, -fz);
+        pthread_mutex_lock(&X.pose_mu);
+        X.org_pos = loc.pose.position;
+        X.org_q.x = 0.0f;
+        X.org_q.y = sinf(yaw * 0.5f);
+        X.org_q.z = 0.0f;
+        X.org_q.w = cosf(yaw * 0.5f);
+        X.org_valid = 1;
+        pthread_mutex_unlock(&X.pose_mu);
+    }
     X.recenter = 0;
+}
+
+/* ---- head-tracked mode: the poses the game draws with ---- */
+static XrQuaternionf qmul(XrQuaternionf a, XrQuaternionf b)
+{
+    XrQuaternionf r;
+    r.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    r.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    return r;
+}
+static XrQuaternionf qconj(XrQuaternionf q) { q.x = -q.x; q.y = -q.y; q.z = -q.z; return q; }
+
+int xrt_immersive(void) { return X.on && X.running && X.immersive && X.org_valid && X.lvalid; }
+
+uint32_t xrt_pose_take(float q[4], float p[3], float *tan_half_h)
+{
+    XrQuaternionf r, c0;
+    V3 d;
+    uint32_t id;
+    float t = 0.0f;
+    int e;
+    if (!xrt_immersive())
+        return 0;
+    pthread_mutex_lock(&X.pose_mu);
+    id = ++X.pose_id;
+    if (!id)
+        id = ++X.pose_id;
+    X.pring[id % 64].v[0] = X.lv[0];
+    X.pring[id % 64].v[1] = X.lv[1];
+    for (e = 0; e < 2; e++) {
+        float a = tanf(X.lv[e].fov.angleRight), b = tanf(-X.lv[e].fov.angleLeft);
+        t = fmaxf(t, fmaxf(a, b));
+    }
+    X.pring[id % 64].tanh = t;
+    c0 = qconj(X.org_q);
+    r = qmul(c0, X.lhead.orientation);
+    d = qrot(c0, vsub(X.lhead.position, X.org_pos));
+    pthread_mutex_unlock(&X.pose_mu);
+    q[0] = r.x; q[1] = r.y; q[2] = r.z; q[3] = r.w;
+    p[0] = d.x; p[1] = d.y; p[2] = d.z;
+    *tan_half_h = t;
+    return id;
 }
 
 /* Both grips: the screen follows the hands (orbits the head), hands apart
@@ -606,9 +677,10 @@ static int mwidth(const char *t, int s) { return (int)strlen(t) * 6 * s - s; }
 
 static void draw_menu(uint8_t *img)
 {
-    static const char *labels[M_COUNT] = {"RESUME", "BACKGROUND", "3D DEPTH", "RECENTER SCREEN", "RESET SCREEN",
+    static const char *labels[M_COUNT] = {"RESUME", "MODE", "BACKGROUND", "3D DEPTH", "RECENTER", "RESET SCREEN",
                                           "EXIT GAME"};
-    const char *values[M_COUNT] = {"", X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY",
+    const char *values[M_COUNT] = {"", X.immersive ? "IMMERSIVE (BETA)" : "SCREEN",
+                                   X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY",
                                    k_depth_name[X.depth_level], "", "", X.exit_armed ? "PRESS A AGAIN" : ""};
     const int band = 170, top = band + 6 + 40;
     int i;
@@ -618,7 +690,7 @@ static void draw_menu(uint8_t *img)
     mtext(img, (MENU_W - mwidth("BURNOUT 3", 12)) / 2, 6 + 22, 12, 0xF26B1DFFu, "BURNOUT 3");
     mtext(img, (MENU_W - mwidth("TAKEDAWN VR", 4)) / 2, 6 + 22 + 96, 4, 0xFFD24AFFu, "TAKEDAWN VR");
     for (i = 0; i < M_COUNT; i++) {
-        int y = top + i * 64, sel = i == X.menu_sel;
+        int y = top + i * 58, sel = i == X.menu_sel;
         uint32_t fg = sel ? 0x101014FFu : 0xFFFFFFFFu;
         if (sel)
             mfill(img, 20, y - 10, MENU_W - 40, 58, 0xF26B1DFFu);
@@ -652,6 +724,13 @@ static void menu_activate(int dir)
         if (dir == 0)
             set_menu(0);
         break;
+    case M_MODE:
+        X.immersive = !X.immersive;
+        nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
+        X.recenter = 1;
+        fprintf(stderr, LOGX "mode: %s\n", X.immersive ? "immersive (head-tracked)" : "screen");
+        save_view();
+        break;
     case M_BACKGROUND:
         if (!X.pt_layer)
             break;
@@ -663,7 +742,7 @@ static void menu_activate(int dir)
         X.depth_level = (X.depth_level + (dir < 0 ? 3 : 1)) % 4;
         if (X.depth_level)
             X.last_depth_on = X.depth_level;
-        nvk_xr_scene_wanted = X.depth_level > 0;
+        nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
         save_view();
         break;
     case M_RECENTER:
@@ -804,7 +883,7 @@ static void sync_actions(void)
                 X.last_depth_on = X.depth_level, X.depth_level = 0;
             else
                 X.depth_level = X.last_depth_on ? X.last_depth_on : 1;
-            nvk_xr_scene_wanted = X.depth_level > 0;
+            nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
             X.view_dirty = 1;
             X.menu_dirty = 1;
             fprintf(stderr, LOGX "3D %s\n", k_depth_name[X.depth_level]);
@@ -1435,7 +1514,9 @@ static const char k_sfs[] =
     "layout(set = 0, binding = 1) uniform sampler2D frm;\n"   /* the frame with its HUD */
     "layout(set = 0, binding = 2) uniform sampler2D scn;\n"   /* the scene before the HUD */
     "layout(set = 0, binding = 3) uniform sampler2D dep;\n"   /* its depth */
-    "layout(push_constant) uniform P { vec4 rf; vec4 rs; vec4 st; } p;\n"
+    /* ph: near, far, 1 = the head-tracked mode's physical shift (a * 1/z,
+     * 0 at infinity, st.y the nearest 1/z), 0 = the screen's (focus at the car) */
+    "layout(push_constant) uniform P { vec4 rf; vec4 rs; vec4 st; vec4 ph; } p;\n"
     "layout(location = 0) in vec2 uv;\n"
     "layout(location = 0) out vec4 o;\n"
     "vec3 lin(vec3 c) {\n"
@@ -1459,10 +1540,12 @@ static const char k_sfs[] =
     "    float f = (D1(vec2(0.5, 0.62)) + D1(vec2(0.42, 0.68)) + D1(vec2(0.58, 0.68))) / 3.0;\n"
     "    f = min(f, 0.99999);\n"
     "    float a = p.st.x, pop = p.st.y;\n"
+    "    bool phys = p.ph.z > 0.5;\n"
+    "    float kmin = phys ? 0.0 : -pop, kmax = phys ? pop : 1.0;\n"
     /* the inverse warp: the source pixels whose shifted place is this one,
      * the nearest of them (the front surface); none is a hole (background
      * uncovered), filled by the fixed-point lookup from the far side */
-    "    float sh0 = a, sh1 = -a * pop;\n"
+    "    float sh0 = a * kmax, sh1 = a * kmin;\n"
     "    float lo = uv.x - max(sh0, sh1), hi = uv.x - min(sh0, sh1);\n"
     "    const int N = 24;\n"
     "    float step_ = max((hi - lo) / float(N), 1e-6);\n"
@@ -1470,20 +1553,23 @@ static const char k_sfs[] =
     /* away from depth edges one shift serves the whole range: the cheap
      * fixed-point lookup; the search only where the range crosses an edge */
     "    float e0 = D1(vec2(lo, uv.y)), e1 = D1(vec2(0.5 * (lo + hi), uv.y)), e2 = D1(vec2(hi, uv.y));\n"
-    "    bool edge = max(e0, max(e1, e2)) - min(e0, min(e1, e2)) > 0.0012 * max(1.0 - f, 1e-4);\n"
+    "    bool edge = max(e0, max(e1, e2)) - min(e0, min(e1, e2)) > (phys ? 2e-6 : 0.0012 * max(1.0 - f, 1e-4));\n"
     "    for (int j = 0; j < N && edge; j++) {\n"
     "        float s = lo + (float(j) + 0.5) * step_;\n"
     /* the widened depth: a soft edge's pixels (the post's colour over
      * the background's depth) go with the post, not with what is behind */
     "        float d = D(vec2(s, uv.y));\n"
-    "        float k = clamp((d - f) / max(1.0 - f, 1e-6), -pop, 1.0);\n"
+    "        float k = phys ? clamp((1.0 - d * (p.ph.y - p.ph.x) / p.ph.y) / p.ph.x, kmin, kmax)\n"
+    "                       : clamp((d - f) / max(1.0 - f, 1e-6), kmin, kmax);\n"
     "        if (abs(s + a * k - uv.x) <= step_ * 0.75 && d < bestd) { bestd = d; best = s; }\n"
     "    }\n"
     "    float s = best;\n"
     "    if (s < 0.0) {\n"
     "        s = uv.x;\n"
     "        for (int i = 0; i < 4; i++) {\n"
-    "            float k = clamp(((edge ? D(vec2(s, uv.y)) : D1(vec2(s, uv.y))) - f) / max(1.0 - f, 1e-6), -pop, 1.0);\n"
+    "            float dd = edge ? D(vec2(s, uv.y)) : D1(vec2(s, uv.y));\n"
+    "            float k = phys ? clamp((1.0 - dd * (p.ph.y - p.ph.x) / p.ph.y) / p.ph.x, kmin, kmax)\n"
+    "                           : clamp((dd - f) / max(1.0 - f, 1e-6), kmin, kmax);\n"
     "            s = uv.x - a * k;\n"
     "        }\n"
     "    }\n"
@@ -1500,7 +1586,7 @@ static int sdraw_init(VkFormat fmt)
     VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     VkDescriptorSetLayoutBinding b[4];
     VkDescriptorSetLayoutCreateInfo dl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48};
+    VkPushConstantRange pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
     VkPipelineLayoutCreateInfo plci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 16 * 4};
     VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -1664,9 +1750,9 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
     if (X.draw_ok == 0 && sampled)
         X.draw_ok = draw_init((VkFormat)X.fmt_srgb) ? 1 : -1;
     draw = sampled && X.draw_ok > 0;
-    if (draw && X.depth_level > 0 && X.sdraw_ok == 0)
+    if (draw && (X.depth_level > 0 || X.immersive) && X.sdraw_ok == 0)
         X.sdraw_ok = sdraw_init((VkFormat)X.fmt_srgb) ? 1 : -1;
-    stereo = draw && X.depth_level > 0 && X.sdraw_ok > 0;
+    stereo = draw && (X.depth_level > 0 || X.immersive) && X.sdraw_ok > 0;
     if (draw) {
         want = X.fmt_srgb;
         qw = (uint32_t)w > XR_MAX_W ? XR_MAX_W : (uint32_t)w;
@@ -1710,6 +1796,7 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
     if (!X.quad || !acquire(X.quad, &X.quad_idx) || X.quad_idx >= X.quad_n)
         return;
     X.quad_acquired = 1;
+    X.quad_pose_pending = scene ? scene->pose : 0;
     if (draw && X.quad_view[X.quad_idx]) {
         VkDescriptorSet set = src_set(src, fmt);
         VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1740,8 +1827,10 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
         r[3] = (float)h / (float)sh;
         if (sset) {
             /* the two eyes, each from the scene and its depth */
-            float pc[12];
+            float pc[16];
             int e;
+            int phys = X.immersive && scene->pose != 0;
+            float tanh = phys ? X.pring[scene->pose % 64].tanh : 1.0f;
             VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
             /* the backend's copies into the slot and its scene (earlier on
              * the queue) before the reads here */
@@ -1756,9 +1845,14 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
             pc[5] = (float)scene->rect[1] / (float)scene->h;
             pc[6] = (float)scene->rect[2] / (float)scene->w;
             pc[7] = (float)scene->rect[3] / (float)scene->h;
-            pc[9] = 0.35f;               /* out of the screen: at most 35% of the depth */
+            pc[9] = phys ? 1.0f : 0.35f;  /* screen: out of it at most 35% of the depth;
+                                           * head-tracked: nothing nearer than 1 unit (1/z) */
             pc[10] = 3.0f / 255.0f;      /* a HUD pixel differs from the scene by more */
             pc[11] = 0.0f;
+            pc[12] = 0.5f;               /* the race camera's near and far (xrcam.c's log) */
+            pc[13] = 10000.0f;
+            pc[14] = phys ? 1.0f : 0.0f;
+            pc[15] = 0.0f;
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spl, 0, 1, &sset, 0, NULL);
             for (e = 0; e < 2; e++) {
@@ -1767,9 +1861,14 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
                     const char *ev = getenv("RECOMP_XR_DEPTH_X");
                     dx = ev && atof(ev) > 0.0 ? (float)atof(ev) : 1.0f;
                 }
-                pc[8] = (e ? 0.5f : -0.5f) * k_depth[X.depth_level] * dx;   /* half each way */
+                if (phys)
+                    /* an eye IPD/2 to the side (1 unit = 1 m): its picture moves the other way,
+                     * by (IPD/2) / z of the half width 2 tan(h/2) */
+                    pc[8] = (e ? -1.0f : 1.0f) * 0.032f * dx / (2.0f * tanh);
+                else
+                    pc[8] = (e ? 0.5f : -0.5f) * k_depth[X.depth_level] * dx;   /* half each way */
                 v.x = (float)(e * qw);
-                vkCmdPushConstants(cb, X.spl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+                vkCmdPushConstants(cb, X.spl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
                 vkCmdSetViewport(cb, 0, 1, &v);
                 vkCmdSetScissor(cb, 0, 1, &sc);
                 vkCmdDraw(cb, 3, 1, 0, 0);
@@ -1828,8 +1927,10 @@ void xrt_quad_submitted(int ok)
         return;
     X.quad_acquired = 0;
     release_locked(X.quad);   /* the caller holds nvk_queue_lock */
-    if (ok)
+    if (ok) {
         X.quad_has_frame = 1;
+        X.quad_pose_id = X.quad_pose_pending;
+    }
 }
 
 /* ---- the frame thread ---- */
@@ -1882,6 +1983,15 @@ static void end_frame(void)
     XrFrameEndInfo fei = {XR_TYPE_FRAME_END_INFO};
     int mr = X.pt_layer && !X.dark, show_menu = X.menu_open && X.menu_sc && X.fs.shouldRender;
     XrResult r;
+    /* head-tracked: the picture drawn with a pose, as a projection layer with
+     * the eye poses it was drawn for (the menus and films stay on the screen) */
+    int imm = X.immersive && X.quad && X.quad_has_frame && X.quad_pose_id && X.quad_stereo
+              && X.fs.shouldRender;
+    XrCompositionLayerProjectionView iv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                              {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    XrCompositionLayerProjection ip = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    if (imm)
+        mr = 0;
 
     if (show_menu && X.menu_dirty) {
         uint32_t mi;
@@ -1912,7 +2022,7 @@ static void end_frame(void)
         ptl.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
         layers[nl++] = (const XrCompositionLayerBaseHeader *)&ptl;
     }
-    if (X.fs.shouldRender) {
+    if (X.fs.shouldRender && !imm) {
         XrViewLocateInfo vli = {XR_TYPE_VIEW_LOCATE_INFO};
         XrViewState vs = {XR_TYPE_VIEW_STATE};
         vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -1961,7 +2071,30 @@ static void end_frame(void)
         }
     }
     pthread_mutex_lock(&X.quad_mu);
-    if (X.quad && X.quad_has_frame && X.fs.shouldRender) {
+    if (imm) {
+        uint32_t id = X.quad_pose_id, e2;
+        float th, tv;
+        pthread_mutex_lock(&X.pose_mu);
+        th = X.pring[id % 64].tanh;
+        tv = th * (float)X.quad_h / (float)(X.quad_w ? X.quad_w : 1);   /* the picture's aspect */
+        for (e2 = 0; e2 < 2; e2++) {
+            iv[e2].pose = X.pring[id % 64].v[e2].pose;
+            iv[e2].fov.angleLeft = -atanf(th);
+            iv[e2].fov.angleRight = atanf(th);
+            iv[e2].fov.angleUp = atanf(tv);
+            iv[e2].fov.angleDown = -atanf(tv);
+            iv[e2].subImage.swapchain = X.quad;
+            iv[e2].subImage.imageRect.offset.x = (int32_t)(e2 * X.quad_w);
+            iv[e2].subImage.imageRect.extent.width = (int32_t)X.quad_w;
+            iv[e2].subImage.imageRect.extent.height = (int32_t)X.quad_h;
+        }
+        pthread_mutex_unlock(&X.pose_mu);
+        ip.space = X.local;
+        ip.viewCount = 2;
+        ip.views = iv;
+        layers[nl++] = (const XrCompositionLayerBaseHeader *)&ip;
+        X.imm_frames++;
+    } else if (X.quad && X.quad_has_frame && X.fs.shouldRender) {
         if (X.ext_layer_settings) {
             qs.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB
                           | XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB;
@@ -2039,6 +2172,30 @@ static void *frame_main(void *arg)
         if (XR_FAILED(r))
             continue;
         sync_actions();
+        if (X.immersive) {
+            /* the poses the game's next picture is drawn with: two display
+             * periods ahead (it is drawn, then shown a frame or two later);
+             * the compositor's reprojection takes care of the rest */
+            XrViewLocateInfo vli = {XR_TYPE_VIEW_LOCATE_INFO};
+            XrViewState vs = {XR_TYPE_VIEW_STATE};
+            XrSpaceLocation hl = {XR_TYPE_SPACE_LOCATION};
+            XrView vv[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+            uint32_t nv = 0;
+            XrTime t = X.fs.predictedDisplayTime + 2 * X.fs.predictedDisplayPeriod;
+            vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+            vli.displayTime = t;
+            vli.space = X.local;
+            if (XR_SUCCEEDED(xrLocateViews(X.session, &vli, &vs, 2, &nv, vv)) && nv == 2
+                    && XR_SUCCEEDED(xrLocateSpace(X.view, X.local, t, &hl))
+                    && (hl.locationFlags & LOC_OK) == LOC_OK) {
+                pthread_mutex_lock(&X.pose_mu);
+                X.lv[0] = vv[0];
+                X.lv[1] = vv[1];
+                X.lhead = hl.pose;
+                X.lvalid = 1;
+                pthread_mutex_unlock(&X.pose_mu);
+            }
+        }
         if (X.motor[0] != X.last_hap[0] || X.motor[1] != X.last_hap[1] || X.motor[0] || X.motor[1])
             refresh_haptics(X.motor[0] != X.last_hap[0] || X.motor[1] != X.last_hap[1]);
         if (X.recenter)
@@ -2046,11 +2203,11 @@ static void *frame_main(void *arg)
         end_frame();
         if (++frames % 1200 == 0) {
             uint64_t t = now_ms();
-            fprintf(stderr, LOGX "frame thread: %.1f frames/s, screen %ux%u%s, %s, 3D %s (game frames: %llu 3D, %llu flat)\n",
+            fprintf(stderr, LOGX "frame thread: %.1f frames/s, screen %ux%u%s, %s, 3D %s (game frames: %llu 3D, %llu flat)%s\n",
                     1200.0 * 1000.0 / (double)(t - t0 ? t - t0 : 1), X.quad_w, X.quad_h,
                     X.quad_stereo ? " x2 eyes" : "", X.dark ? "dark room" : "mixed reality",
                     k_depth_name[X.depth_level], (unsigned long long)X.frames3d,
-                    (unsigned long long)X.frames2d);
+                    (unsigned long long)X.frames2d, X.immersive ? (X.imm_frames ? ", immersive: head-tracked layers" : ", immersive: no posed picture yet") : "");
             t0 = t;
         }
     }
@@ -2121,7 +2278,8 @@ int xrt_start(const struct nvk_core *C)
     }
     init_passthrough();
     X.last_depth_on = X.depth_level ? X.depth_level : 1;
-    nvk_xr_scene_wanted = X.depth_level > 0;
+    nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
+    pthread_mutex_init(&X.pose_mu, NULL);
     xbox_InputSetXrSource(xr_pad_state, xr_rumble);
     X.thread_run = 1;
     if (pthread_create(&X.thread, NULL, frame_main, NULL) != 0) {

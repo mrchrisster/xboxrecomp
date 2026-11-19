@@ -308,6 +308,8 @@ void nv2a_pb_dump_host_px(const uint8_t *px, uint32_t hw, uint32_t hh);
  * queued after it. Any thread may queue; one producer at a time. */
 void nv2a_pb_stream_mark(uint32_t va, uint32_t tag);
 uint32_t nv2a_pb_stream_tag(void);
+/* The last pose index mark reached (tag | 0x80000000; a headset's pose). */
+uint32_t nv2a_pb_stream_pose(void);
 void nv2a_pb_stream_tag_set(uint32_t tag);
 
 /* A host's own work at every flip (a title's debug monitor: Burnout 3's

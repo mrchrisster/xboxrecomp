@@ -362,6 +362,10 @@ void nv2a_pb_stream_mark(uint32_t va, uint32_t tag)
     __atomic_store_n(&s_sm_w, w + 1, __ATOMIC_RELEASE);
 }
 uint32_t nv2a_pb_stream_tag(void) { return s_sm_tag; }
+/* A mark with the top bit set is a pose index (a headset's, video/
+ * xr_theater.c), kept apart from the scene tag. */
+static volatile uint32_t s_sm_pose;
+uint32_t nv2a_pb_stream_pose(void) { return s_sm_pose; }
 void nv2a_pb_stream_tag_set(uint32_t tag) { s_sm_tag = tag; }
 
 /* The marks queued at `va`, applied; called with every word's address. */
@@ -370,7 +374,10 @@ static inline void sm_reach(uint32_t va)
     uint32_t r = s_sm_r;
     while (r != __atomic_load_n(&s_sm_w, __ATOMIC_ACQUIRE)
            && s_sm[r % SM_N].va == (va & SM_MASK)) {
-        s_sm_tag = s_sm[r % SM_N].tag;
+        if (s_sm[r % SM_N].tag & 0x80000000u)
+            s_sm_pose = s_sm[r % SM_N].tag & 0x7FFFFFFFu;
+        else
+            s_sm_tag = s_sm[r % SM_N].tag;
         r++;
         s_sm_hit++;
     }

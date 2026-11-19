@@ -6862,13 +6862,14 @@ static void hdr_draw(const RenderTarget *rt, float hdr[4])
  * to the window slot (fbv_slot_scene). A frame with no scene (menus, films)
  * has none: the headset shows it flat. Depth goes through a buffer into an
  * R32 float image, as a sampled colour image. */
-struct fbv_scene_img { struct nvk_image col, dep; int valid; };
+struct fbv_scene_img { struct nvk_image col, dep; int valid; uint32_t pose; };
 extern struct fbv_scene_img *fbv_slot_scene(const void *slot, uint32_t w, uint32_t h);
 static struct nvk_image  s_xs_col, s_xs_dep;
 static struct nvk_buffer s_xs_buf;
 static int      s_xs_have;          /* this frame's scene is copied aside */
 static int      s_xs_last_scene;    /* the last draw into a shown target was the scene's */
 static uint32_t s_xs_w, s_xs_h;
+static uint32_t s_xs_pose;         /* the pose index the scene was drawn with */
 
 static int xs_images(uint32_t w, uint32_t h)
 {
@@ -6949,6 +6950,7 @@ static void xs_mark(RenderTarget *rt)
         vkCmdCopyBufferToImage(s_cmd, s_xs_buf.buf, s_xs_dep.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                1, &bc);
         s_xs_have = 1;
+        s_xs_pose = nv2a_pb_stream_pose();
         s_xs_w = rt->hw;
         s_xs_h = rt->hh;
     }
@@ -6980,6 +6982,7 @@ static void xs_flip(void *slot, uint32_t w, uint32_t h)
         vkCmdCopyImage(s_cmd, s_xs_dep.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                        s->dep.img, VK_IMAGE_LAYOUT_GENERAL, 1, &ic);
         s->valid = 1;
+        s->pose = s_xs_pose;
     } else if (s) {
         s->valid = 0;
     }

@@ -142,7 +142,7 @@ static int              s_fi;
 static struct nvk_image s_slot[3];       /* GENERAL once written */
 /* A headset's 3D (xr_theater.c): each slot's scene before the HUD and its
  * depth, written by the backend at the flip (nv2a_pb_vulkan.c xs_flip). */
-struct fbv_scene_img { struct nvk_image col, dep; int valid; };
+struct fbv_scene_img { struct nvk_image col, dep; int valid; uint32_t pose; };
 static struct fbv_scene_img s_scene[3];
 static void post_destroy(void);          /* the post passes, below */
 
@@ -3625,6 +3625,7 @@ int fbv_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, int filter,
             xs.w = s_slot[k].w;
             xs.h = s_slot[k].h;
             memcpy(xs.rect, s_xr_src, sizeof xs.rect);
+            xs.pose = s_scene[k].pose;
         }
         xrt_quad_record(cb, s_sc_img[idx], s_sc_fmt, s_xr_rect[0], s_xr_rect[1],
                         s_xr_rect[2], s_xr_rect[3], s_sc_sampled,

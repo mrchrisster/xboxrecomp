@@ -58,7 +58,17 @@ struct xrt_scene {
     VkImageView frame_view, scene_view, depth_view;
     uint32_t w, h;
     int rect[4];
+    uint32_t pose;          /* the head pose index it was drawn with (xrt_pose_take), 0 none */
 };
+
+/* Head-tracked mode (the VR menu's MODE: IMMERSIVE). The game, each picture
+ * it draws: the latest predicted head pose relative to the re-centred origin
+ * (q x y z w; p in metres; OpenXR's axes: x right, y up, z back), the
+ * horizontal tangent of the field of view to draw with, and the pose's index
+ * (to mark in the push buffer, so the picture is shown with the eye poses it
+ * was drawn for). Returns 0 when the mode is off. */
+int xrt_immersive(void);
+uint32_t xrt_pose_take(float q[4], float p[3], float *tan_half_h);
 
 /* sampled: img has SAMPLED usage (drawn, scaled to at most 1920 wide, by a
  * render pass); else copied as it is. sw, sh: img's size. */
