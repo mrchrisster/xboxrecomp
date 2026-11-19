@@ -77,7 +77,7 @@ static XrQuaternionf facing(V3 dir)
     return r;
 }
 
-/* Defaults: Christoph's Futurama placement (2026-11-17) at 16:9. */
+/* Defaults: Futurama Quest's placement, at 16:9. */
 #define DEF_DIST   1.8f
 #define DEF_ELEV   0.077f
 #define DEF_HEIGHT 1.20f
