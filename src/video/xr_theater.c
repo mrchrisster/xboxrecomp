@@ -1591,8 +1591,12 @@ static const char k_sfs[] =
     "    float best = -1.0, bestd = 2.0;\n"
     /* away from depth edges one shift serves the whole range: the cheap
      * fixed-point lookup; the search only where the range crosses an edge */
-    "    float e0 = D1(vec2(lo, uv.y)), e1 = D1(vec2(0.5 * (lo + hi), uv.y)), e2 = D1(vec2(hi, uv.y));\n"
-    "    bool edge = max(e0, max(e1, e2)) - min(e0, min(e1, e2)) > (phys ? 2e-6 : 0.0012 * max(1.0 - f, 1e-4));\n"
+    /* nine samples across the range (two texels apart at most at NORMAL):
+     * three let thin near things between them (the car's side mirrors)
+     * take the cheap path and come apart from the car */
+    "    float emn = 2.0, emx = -1.0;\n"
+    "    for (int j = 0; j < 9; j++) { float e = D1(vec2(mix(lo, hi, float(j) / 8.0), uv.y)); emn = min(emn, e); emx = max(emx, e); }\n"
+    "    bool edge = emx - emn > (phys ? 2e-6 : 0.0012 * max(1.0 - f, 1e-4));\n"
     "    for (int j = 0; j < N && edge; j++) {\n"
     "        float s = lo + (float(j) + 0.5) * step_;\n"
     /* the widened depth: a soft edge's pixels (the post's colour over
@@ -1615,10 +1619,21 @@ static const char k_sfs[] =
     "    vec2 su = vec2(clamp(s, 0.0, 1.0), uv.y);\n"
     "    vec3 c;\n"
     /* head-tracked: the HUD is on its own panel, never in the eyes */
+    /* screen: the HUD and menus over a 3D scene at the nearest depth the
+     * scene can come out to (k = -pop), so nothing of the scene comes
+     * through in front of them (a results page over the race) */
+    "    vec2 hu = vec2(uv.x + a * pop, uv.y);\n"
+    "    bool hh = !phys && hud(hu);\n"
     "    if (phys) c = hud(su) ? texture(scn, S(su)).rgb : texture(fin, p.rf.xy + su * p.rf.zw).rgb;\n"
-    "    else if (hud(uv)) c = texture(fin, p.rf.xy + uv * p.rf.zw).rgb;\n"
+    "    else if (hh) c = texture(fin, p.rf.xy + hu * p.rf.zw).rgb;\n"
     "    else if (hud(su)) c = texture(scn, S(su)).rgb;\n"
     "    else c = texture(fin, p.rf.xy + su * p.rf.zw).rgb;\n"
+    /* RECOMP_XR_DEBUG=mask: what the 3D takes for HUD, tinted red */
+    "    if (p.ph.w > 0.5 && p.ph.w < 1.5 && (hh || hud(su))) c = mix(c, vec3(1.0, 0.0, 0.0), 0.6);\n"
+    /* RECOMP_XR_DEBUG=depth: the depth the 3D uses (white = the focus,
+     * dark = far), the HUD in red */
+    "    if (p.ph.w > 1.5) { float dv = D1(uv); float kk = clamp((dv - f) / max(1.0 - f, 1e-6), 0.0, 1.0);\n"
+    "        c = hud(uv) ? vec3(1.0, 0.0, 0.0) : vec3(pow(1.0 - kk, 3.0)); }\n"
     "    o = vec4(lin(c), 1.0);\n"
     "}\n";
 
@@ -1969,7 +1984,14 @@ void xrt_quad_record(VkCommandBuffer cb, VkImage src, VkFormat fmt, int x, int y
             pc[12] = 0.5f;               /* the race camera's near and far (xrcam.c's log) */
             pc[13] = 10000.0f;
             pc[14] = phys ? 1.0f : 0.0f;
-            pc[15] = 0.0f;
+            {
+                static int dbg = -1;
+                if (dbg < 0) {
+                    const char *ev = getenv("RECOMP_XR_DEBUG");
+                    dbg = !ev ? 0 : strstr(ev, "depth") ? 2 : strstr(ev, "mask") ? 1 : 0;
+                }
+                pc[15] = (float)dbg;
+            }
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spipe);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, X.spl, 0, 1, &sset, 0, NULL);
             for (e = 0; e < 2; e++) {
