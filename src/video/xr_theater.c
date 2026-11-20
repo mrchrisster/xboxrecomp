@@ -96,7 +96,8 @@ static XrQuaternionf facing(V3 dir)
 #define PROJ_DIM 64
 #define MAXIMG 8
 
-enum { M_RESUME, M_MODE, M_LEVEL, M_FILL, M_BACKGROUND, M_3D, M_RECENTER, M_RESET, M_EXIT, M_COUNT };
+enum { M_RESUME, M_MODE, M_LEVEL, M_FILL, M_BACKGROUND, M_3D, M_TEX, M_ANISO, M_SCALE, M_HZ, M_RECENTER, M_RESET,
+       M_EXIT, M_COUNT };
 static const char *const k_fill_name[3] = {"16:9", "4:3", "FULL"};
 static const float k_fill_aspect[3] = {0.0f, 0.75f, 1.0f};
 
@@ -142,6 +143,9 @@ static struct {
     /* head-tracked mode (MODE: IMMERSIVE) */
     int immersive;
     float hz_live;               /* the refresh the menu's mode switch asked for */
+    /* GRAPHICS rows (GameActivity reads files/xr_graphics.txt at the start;
+     * BO3_GFX says what this start runs with) */
+    int g_up, g_an, g_sc, g_hz, g_light, g_restart, g_loaded;
     pthread_mutex_t pose_mu;
     XrView lv[2];                /* the latest located views (predicted display time) */
     XrPosef lhead;               /* and the head (VIEW space in LOCAL) */
@@ -709,31 +713,72 @@ static void mtext(uint8_t *img, int x0, int y0, int s, uint32_t rgba, const char
 
 static int mwidth(const char *t, int s) { return (int)strlen(t) * 6 * s - s; }
 
+static void gfx_load(void)
+{
+    const char *e = getenv("BO3_GFX");
+    int u = 1, an = 16, sc = 3, hz = 120, model = 3, imm = 0;
+    if (X.g_loaded)
+        return;
+    X.g_loaded = 1;
+    if (e)
+        sscanf(e, "%d %d %d %d %d %d", &u, &an, &sc, &hz, &model, &imm);
+    X.g_up = u != 0;
+    X.g_an = an >= 16 ? 16 : an >= 8 ? 8 : 4;
+    X.g_sc = sc <= 2 ? 2 : sc >= 4 ? 4 : 3;
+    X.g_hz = hz <= 72 ? 72 : hz <= 90 ? 90 : 120;
+    X.g_light = model == 2;
+}
+
+static void gfx_save(void)
+{
+    char path[sizeof X.prefs + 16];
+    char *slash;
+    FILE *f;
+    snprintf(path, sizeof path, "%s", X.prefs);
+    slash = strrchr(path, '/');
+    if (!slash)
+        return;
+    strcpy(slash + 1, "xr_graphics.txt");
+    if (!(f = fopen(path, "w")))
+        return;
+    fprintf(f, "g1 %d %d %d %d\n", X.g_up, X.g_an, X.g_sc, X.g_hz);
+    fclose(f);
+}
+
 static void draw_menu(uint8_t *img)
 {
     static const char *labels[M_COUNT] = {"RESUME", "MODE", "LEVEL HORIZON", "VIEW", "BACKGROUND", "3D DEPTH",
+                                          "TEXTURES", "FILTERING", "RENDER SCALE", "REFRESH",
                                           "RECENTER", "RESET SCREEN", "EXIT GAME"};
-    const char *values[M_COUNT] = {"", !X.immersive ? "SCREEN" : nv2a_host_render_scale_x2() < 4 ? "IMMERSIVE: RESTART FOR HD" : "IMMERSIVE (BETA)",
+    char vt[24], va[24], vs[24], vh[24];
+    const char *rs = X.g_restart ? " (RESTART)" : "";
+    gfx_load();
+    snprintf(vt, sizeof vt, "%s%s", X.g_up ? "NNEDI3 2X" : "ORIGINAL", rs);
+    snprintf(va, sizeof va, "%dX%s", X.g_an, rs);
+    snprintf(vs, sizeof vs, "%s%s", X.g_sc == 2 ? "1.0" : X.g_sc == 3 ? "1.5" : "2.0", rs);
+    snprintf(vh, sizeof vh, "%d HZ", X.g_hz);
+    const char *values[M_COUNT] = {"", !X.immersive ? "SCREEN" : !X.g_light && nv2a_host_render_scale_x2() < 4 ? "IMMERSIVE: RESTART FOR HD" : "IMMERSIVE (BETA)",
                                    X.level ? "ON" : "OFF", k_fill_name[X.fill],
                                    X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY",
-                                   k_depth_name[X.depth_level], "", "", X.exit_armed ? "PRESS A AGAIN" : ""};
-    const int band = 150, top = band + 6 + 26;
+                                   k_depth_name[X.depth_level], vt, va, vs, vh, "", "",
+                                   X.exit_armed ? "PRESS A AGAIN" : ""};
+    const int band = 112, top = band + 6 + 22, row = 38;
     int i;
     mfill(img, 0, 0, MENU_W, MENU_H, 0xF26B1DFFu);              /* orange border */
     mfill(img, 6, 6, MENU_W - 12, MENU_H - 12, 0x101014FFu);     /* dark panel */
     mfill(img, 6, 6, MENU_W - 12, band, 0x2A0F08FFu);            /* header band */
-    mtext(img, (MENU_W - mwidth("BURNOUT 3", 12)) / 2, 6 + 16, 12, 0xF26B1DFFu, "BURNOUT 3");
-    mtext(img, (MENU_W - mwidth("TAKEDAWN VR", 4)) / 2, 6 + 16 + 90, 4, 0xFFD24AFFu, "TAKEDAWN VR");
+    mtext(img, (MENU_W - mwidth("BURNOUT 3", 9)) / 2, 6 + 12, 9, 0xF26B1DFFu, "BURNOUT 3");
+    mtext(img, (MENU_W - mwidth("TAKEDAWN VR", 3)) / 2, 6 + 12 + 70, 3, 0xFFD24AFFu, "TAKEDAWN VR");
     for (i = 0; i < M_COUNT; i++) {
-        int y = top + i * 50, sel = i == X.menu_sel;
+        int y = top + i * row, sel = i == X.menu_sel;
         uint32_t fg = sel ? 0x101014FFu : 0xFFFFFFFFu;
         if (sel)
-            mfill(img, 20, y - 10, MENU_W - 40, 58, 0xF26B1DFFu);
-        mtext(img, 44, y, 5, fg, labels[i]);
+            mfill(img, 20, y - 7, MENU_W - 40, row, 0xF26B1DFFu);
+        mtext(img, 44, y, 4, fg, labels[i]);
         if (values[i][0]) {
             char v[64];
             snprintf(v, sizeof v, i == M_EXIT ? "%s" : "- %s +", values[i]);
-            mtext(img, MENU_W - 44 - mwidth(v, 4), y + 4, 4, sel ? 0x101014FFu : 0xFFD24AFFu, v);
+            mtext(img, MENU_W - 44 - mwidth(v, 3), y + 3, 3, sel ? 0x101014FFu : 0xFFD24AFFu, v);
         }
     }
     mtext(img, 44, MENU_H - 50, 3, 0xB8C4E0FFu, "STICK: CHANGE  A: OK  B: CLOSE  L3+R3: CLOSE");
@@ -766,8 +811,9 @@ static void menu_activate(int dir)
         fprintf(stderr, LOGX "mode: %s\n", X.immersive ? "immersive (head-tracked)" : "screen");
         /* immersive at 90 Hz, the screen at 120 (the start does the same,
          * GameActivity); RECOMP_XR_HZ in env.txt keeps its own */
-        if (!getenv("RECOMP_XR_HZ") || X.hz_live > 0.0f) {
-            X.hz_live = X.immersive ? 90.0f : 120.0f;
+        {
+            gfx_load();
+            X.hz_live = X.immersive && !X.g_light ? 90.0f : (float)X.g_hz;
             perf_and_refresh();
         }
         save_view();
@@ -793,6 +839,34 @@ static void menu_activate(int dir)
             X.last_depth_on = X.depth_level;
         nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
         save_view();
+        break;
+    case M_TEX:
+        gfx_load();
+        X.g_up = !X.g_up;
+        X.g_restart = 1;
+        gfx_save();
+        break;
+    case M_ANISO:
+        gfx_load();
+        X.g_an = dir < 0 ? (X.g_an == 4 ? 16 : X.g_an / 2) : (X.g_an == 16 ? 4 : X.g_an * 2);
+        X.g_restart = 1;
+        gfx_save();
+        break;
+    case M_SCALE:
+        gfx_load();
+        X.g_sc = dir < 0 ? (X.g_sc == 2 ? 4 : X.g_sc - 1) : (X.g_sc == 4 ? 2 : X.g_sc + 1);
+        X.g_restart = 1;
+        gfx_save();
+        break;
+    case M_HZ:
+        gfx_load();
+        X.g_hz = dir < 0 ? (X.g_hz == 72 ? 120 : X.g_hz == 90 ? 72 : 90)
+                         : (X.g_hz == 72 ? 90 : X.g_hz == 90 ? 120 : 72);
+        gfx_save();
+        if (!X.immersive) {      /* live; immersive keeps its 90 */
+            X.hz_live = (float)X.g_hz;
+            perf_and_refresh();
+        }
         break;
     case M_RECENTER:
         if (dir == 0)
@@ -2123,6 +2197,13 @@ static void poll_events(void)
                     X.running = 1;
                     X.recenter = 1;
                     perf_and_refresh();
+                    {   /* RECOMP_XR_DEBUG=menu: the VR menu open from the start (test shots) */
+                        const char *dv = getenv("RECOMP_XR_DEBUG");
+                        if (dv && strstr(dv, "menu")) {
+                            set_menu(1);
+                            X.menu_sel = M_TEX;
+                        }
+                    }
                 }
             } else if (X.state == XR_SESSION_STATE_STOPPING) {
                 if (X.running)
