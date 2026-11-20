@@ -1605,6 +1605,12 @@ static const char k_sfs[] =
     "    int N = clamp(int(ceil((hi - lo) * tw)), 8, 96);\n"
     "    float step_ = max((hi - lo) / float(N), 1e-6);\n"
     "    float best = -1.0, bestd = 2.0;\n"
+    /* the farthest surface in the range and, of its samples, the one whose
+     * shifted place is nearest: what a hole (background the shift uncovers
+     * beside a near thing) is stretched from, never the near thing itself
+     * (dark wedges off the car's wings over a bright road) */
+    "    float bg = -1.0, bgd = -1.0, bge = 1e9;\n"
+    "    float thr = phys ? 2e-6 : 0.0012 * max(1.0 - f, 1e-4);\n"
     /* away from depth edges one shift serves the whole range: the cheap
      * fixed-point lookup; the search only where the range crosses an edge */
     /* nine samples across the range (two texels apart at most at NORMAL):
@@ -1620,9 +1626,14 @@ static const char k_sfs[] =
     "        float d = D(vec2(s, uv.y));\n"
     "        float k = phys ? clamp((1.0 - d * (p.ph.y - p.ph.x) / p.ph.y) / p.ph.x, kmin, kmax)\n"
     "                       : clamp((d - f) / max(1.0 - f, 1e-6), kmin, kmax);\n"
-    "        if (abs(s + a * k - uv.x) <= step_ * 0.75 && d < bestd) { bestd = d; best = s; }\n"
+    "        float er = abs(s + a * k - uv.x);\n"
+    "        if (er <= step_ * 0.75 && d < bestd) { bestd = d; best = s; }\n"
+    "        float d1 = D1(vec2(s, uv.y));\n"
+    "        if (d1 > bgd + thr) { bgd = d1; bg = s; bge = er; }\n"
+    "        else if (d1 > bgd - thr && er < bge) { bg = s; bge = er; if (d1 > bgd) bgd = d1; }\n"
     "    }\n"
     "    float s = best;\n"
+    "    if (s < 0.0 && edge && bg >= 0.0) s = bg;\n"
     "    if (s < 0.0) {\n"
     "        s = uv.x;\n"
     "        for (int i = 0; i < 4; i++) {\n"
