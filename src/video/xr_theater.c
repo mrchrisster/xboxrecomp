@@ -30,6 +30,9 @@
 #include "input/touch_pad.h"
 #include "xr_theater.h"
 
+unsigned nv2a_host_render_scale_x2(void);
+static void perf_and_refresh(void);
+
 #define LOGX "[XR] "
 
 /* ---- maths (local space, metres) ---- */
@@ -138,6 +141,7 @@ static struct {
     uint64_t frames3d, frames2d;
     /* head-tracked mode (MODE: IMMERSIVE) */
     int immersive;
+    float hz_live;               /* the refresh the menu's mode switch asked for */
     pthread_mutex_t pose_mu;
     XrView lv[2];                /* the latest located views (predicted display time) */
     XrPosef lhead;               /* and the head (VIEW space in LOCAL) */
@@ -709,7 +713,7 @@ static void draw_menu(uint8_t *img)
 {
     static const char *labels[M_COUNT] = {"RESUME", "MODE", "LEVEL HORIZON", "VIEW", "BACKGROUND", "3D DEPTH",
                                           "RECENTER", "RESET SCREEN", "EXIT GAME"};
-    const char *values[M_COUNT] = {"", X.immersive ? "IMMERSIVE (BETA)" : "SCREEN",
+    const char *values[M_COUNT] = {"", !X.immersive ? "SCREEN" : nv2a_host_render_scale_x2() < 4 ? "IMMERSIVE: RESTART FOR HD" : "IMMERSIVE (BETA)",
                                    X.level ? "ON" : "OFF", k_fill_name[X.fill],
                                    X.dark || !X.pt_layer ? "DARK ROOM" : "MIXED REALITY",
                                    k_depth_name[X.depth_level], "", "", X.exit_armed ? "PRESS A AGAIN" : ""};
@@ -760,6 +764,12 @@ static void menu_activate(int dir)
         nvk_xr_scene_wanted = X.depth_level > 0 || X.immersive;
         X.recenter = 1;
         fprintf(stderr, LOGX "mode: %s\n", X.immersive ? "immersive (head-tracked)" : "screen");
+        /* immersive at 90 Hz, the screen at 120 (the start does the same,
+         * GameActivity); RECOMP_XR_HZ in env.txt keeps its own */
+        if (!getenv("RECOMP_XR_HZ") || X.hz_live > 0.0f) {
+            X.hz_live = X.immersive ? 90.0f : 120.0f;
+            perf_and_refresh();
+        }
         save_view();
         break;
     case M_LEVEL:
@@ -1184,6 +1194,8 @@ static void perf_and_refresh(void)
         uint32_t n = 0, i;
         const char *want = getenv("RECOMP_XR_HZ");
         float w = want && *want ? (float)atof(want) : 120.0f;
+        if (X.hz_live > 0.0f)
+            w = X.hz_live;   /* the mode switched in the menu */
         if (!en || !rq || XR_FAILED(en(X.session, 16, &n, rates)))
             return;
         for (i = 0; i < n; i++)
