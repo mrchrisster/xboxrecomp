@@ -1598,7 +1598,11 @@ static const char k_sfs[] =
      * uncovered), filled by the fixed-point lookup from the far side */
     "    float sh0 = a * kmax, sh1 = a * kmin;\n"
     "    float lo = uv.x - max(sh0, sh1), hi = uv.x - min(sh0, sh1);\n"
-    "    const int N = 24;\n"
+    /* a step of at most one source texel: coarser steps (24 over the
+     * range at DEEP and EXTRA) let the car's bright edge pixels land up to
+     * half a step outside its outline, as specks along its sides */
+    "    float tw = float(textureSize(dep, 0).x) * p.rs.z;\n"
+    "    int N = clamp(int(ceil((hi - lo) * tw)), 8, 96);\n"
     "    float step_ = max((hi - lo) / float(N), 1e-6);\n"
     "    float best = -1.0, bestd = 2.0;\n"
     /* away from depth edges one shift serves the whole range: the cheap
